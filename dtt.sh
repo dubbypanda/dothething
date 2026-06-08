@@ -10,7 +10,12 @@ DTT_SELF="$(realpath "$_dtt_s" 2>/dev/null || echo "$(cd "$(dirname "$_dtt_s")" 
 unset _dtt_s
 
 BASE="/tmp/dothething"
-VENV="$BASE/venv"
+# Expensive, reinstallable artifacts (main venv + deps, Notte, SearXNG) are
+# cached under ~/.dtt so they survive reboots. /tmp is wiped on restart, which
+# would otherwise force a full reinstall on every run. Only ephemeral runtime
+# files (the generated agent.py, logs, settings, fetch cache) stay in $BASE.
+DTT_CACHE="$HOME/.dtt/cache"
+VENV="$DTT_CACHE/venv"
 
 # ── Auto-update ─────────────────────────────────────────────────
 # dtt_update [force]   — when force=1, bypass the 6h rate-limit and print status
@@ -144,7 +149,7 @@ HELP
   esac
 done
 
-mkdir -p "$BASE"
+mkdir -p "$BASE" "$DTT_CACHE"
 if [ "$FORCE_UPDATE" = true ]; then
     dtt_update 1 || true
     exit 0
@@ -262,36 +267,36 @@ if [ ! -d "$VENV" ]; then
 fi
 source "$VENV/bin/activate"
 
-if [ ! -f "$BASE/.deps_v7" ]; then
+if [ ! -f "$DTT_CACHE/.deps_v7" ]; then
     echo "▸ Installing dependencies (first run)..."
     pip install -q -U pip setuptools wheel 2>/dev/null
     pip install -q requests httpx "prompt_toolkit>=3" \
         lxml beautifulsoup4 pyyaml Pillow tiktoken \
         markitdown pypdf python-docx openpyxl tabulate mcp \
         rich textual agentmail 2>/dev/null
-    touch "$BASE/.deps_v7"
+    touch "$DTT_CACHE/.deps_v7"
 fi
 
 # ── SearXNG in its own venv ──────────────────────────────────────
-if [ ! -f "$BASE/.searxng_v4" ]; then
+if [ ! -f "$DTT_CACHE/.searxng_v4" ]; then
     echo "▸ Installing SearXNG (first run — takes 1-2 min)..."
     # v4 bump: force a fresh clone so earlier versions that trampled
     # searx/settings.yml get a clean default back.
-    rm -rf "$BASE/searxng"
-    git clone --depth 1 -q https://github.com/searxng/searxng.git "$BASE/searxng"
-    [ ! -f "$BASE/searxng_venv/bin/activate" ] && python3 -m venv "$BASE/searxng_venv"
-    "$BASE/searxng_venv/bin/pip" install -q -U pip setuptools wheel pyyaml msgspec typing_extensions 2>/dev/null
-    "$BASE/searxng_venv/bin/pip" install -q pdm 2>/dev/null || true
-    "$BASE/searxng_venv/bin/pip" install -q --use-pep517 --no-build-isolation -e "$BASE/searxng" 2>/dev/null
-    touch "$BASE/.searxng_v4"
+    rm -rf "$DTT_CACHE/searxng"
+    git clone --depth 1 -q https://github.com/searxng/searxng.git "$DTT_CACHE/searxng"
+    [ ! -f "$DTT_CACHE/searxng_venv/bin/activate" ] && python3 -m venv "$DTT_CACHE/searxng_venv"
+    "$DTT_CACHE/searxng_venv/bin/pip" install -q -U pip setuptools wheel pyyaml msgspec typing_extensions 2>/dev/null
+    "$DTT_CACHE/searxng_venv/bin/pip" install -q pdm 2>/dev/null || true
+    "$DTT_CACHE/searxng_venv/bin/pip" install -q --use-pep517 --no-build-isolation -e "$DTT_CACHE/searxng" 2>/dev/null
+    touch "$DTT_CACHE/.searxng_v4"
 fi
 
 # ── Notte browser framework ────────────────────────────────────
-if [ ! -f "$BASE/.notte_v2" ]; then
+if [ ! -f "$DTT_CACHE/.notte_v2" ]; then
     echo "▸ Installing Notte browser framework (first run)..."
     pip install -q "notte[camoufox,captcha] @ git+https://github.com/fluffypony/notte.git" || { echo "✗ Notte install failed" >&2; exit 1; }
     python -m camoufox fetch || { echo "✗ Camoufox browser fetch failed" >&2; exit 1; }
-    touch "$BASE/.notte_v2"
+    touch "$DTT_CACHE/.notte_v2"
 fi
 
 # Playwright 1.60's Firefox driver can crash when Firefox reports a page error
@@ -349,7 +354,8 @@ except ImportError:
 # Constants
 # ═══════════════════════════════════════════════════════════════════
 BASE            = Path("/tmp/dothething")
-VENV            = BASE / "venv"
+DTT_CACHE       = Path.home() / ".dtt" / "cache"
+VENV            = DTT_CACHE / "venv"
 DTT_DIR         = Path.home() / ".dtt" / "threads"
 
 # DTT always drives Notte through Camoufox. Camoufox returns Playwright
@@ -667,7 +673,7 @@ class SearXNG:
         if spinner:
             spinner.update(f"Starting SearXNG on :{self.port}...")
 
-        src = BASE / "searxng"
+        src = DTT_CACHE / "searxng"
 
         cfg = {
             "use_default_settings": {
@@ -701,7 +707,7 @@ class SearXNG:
         with open(self.settings_path, "w") as f:
             yaml.dump(cfg, f)
 
-        python = str(BASE / "searxng_venv" / "bin" / "python")
+        python = str(DTT_CACHE / "searxng_venv" / "bin" / "python")
         env = os.environ.copy()
         env["SEARXNG_SETTINGS_PATH"] = str(self.settings_path)
 

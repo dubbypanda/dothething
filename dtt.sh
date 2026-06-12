@@ -101,9 +101,9 @@ dothething — autonomous AI agent | https://dotheth.ing
 
 Usage:
   ./dtt.sh [--fast] [--prompt "..."] [--cwd DIR] [--max-loops N]
-           [--oraclepro] [--headed] [--orchestrator] [--verbose]
-           [--debug] [--keep-temp] [--resume THREAD_ID] [--version]
-           [--update] [--pipe] [--tui] [--notify-desktop]
+           [--oraclepro] [--max-effort] [--headed] [--orchestrator]
+           [--verbose] [--debug] [--keep-temp] [--resume THREAD_ID]
+           [--version] [--update] [--pipe] [--tui] [--notify-desktop]
            [--notify-email EMAIL] [--max-cost USD]
 
 Flags:
@@ -112,6 +112,8 @@ Flags:
   --cwd DIR       Working directory for relative paths (default: .)
   --max-loops N   Maximum agent loop iterations (default: 200)
   --oraclepro     Use openai/gpt-5.5-pro for oracle (default: openai/gpt-5.5)
+  --max-effort    Raise Fable effort to 'max' and GPT-5.5 oracle to 'high'
+                  (default: 'xhigh' for both)
   --resume ID     Resume a previous thread by ID (from ~/.dtt/threads/).
                   Combine with --prompt or positional text, or just let the
                   editor open, to supply fresh instructions on resume.
@@ -3896,9 +3898,13 @@ class Agent:
         "shell_session":       "_tool_shell_session",
     }
 
-    def __init__(self, model, oracle_model, api_key, cwd, debug=False, verbose=False, headed=False):
+    def __init__(self, model, oracle_model, api_key, cwd, debug=False, verbose=False, headed=False, max_effort=False):
         self.model = model
         self.oracle_model = oracle_model
+        self.max_effort = max_effort
+        # --max-effort pushes Fable to "max" and GPT-5.5 (oracle) to "high"; otherwise both default to "xhigh".
+        self._model_effort = "max" if max_effort else "xhigh"
+        self._oracle_effort = "high" if max_effort else "xhigh"
         self.api_key = api_key
         self.cwd = cwd
         self.debug = debug
@@ -4583,7 +4589,7 @@ class Agent:
                     "messages": [{"role": "system", "content": system}] + msgs,
                     "temperature": 0.2,
                     "max_tokens": 16384,
-                    "reasoning": {"effort": "xhigh"},
+                    "reasoning": {"effort": self._oracle_effort},
                     "session_id": getattr(self, "_thread_id", "") + ":oracle",
                 },
                 timeout=300,
@@ -6972,7 +6978,7 @@ class Agent:
                     "parallel_tool_calls": True,
                     "temperature": 0.2,
                     "max_tokens": 16384,
-                    "reasoning": {"effort": "xhigh"},
+                    "reasoning": {"effort": self._model_effort},
                     "session_id": getattr(self, "_thread_id", ""),
                     "cache_control": {"type": "ephemeral"},
                 }
@@ -7535,8 +7541,8 @@ async def run_agent(prompt, model, oracle_model, api_key, cwd, max_loops,
                     debug, verbose, headed=False, resume_id=None, worker_mode=False,
                     control_file=None, searxng_url=None, pipe_mode=False,
                     notify_desktop=False, notify_email=None, max_cost=None,
-                    tui_mode=False):
-    agent = Agent(model, oracle_model, api_key, cwd, debug=debug, verbose=verbose, headed=headed)
+                    tui_mode=False, max_effort=False):
+    agent = Agent(model, oracle_model, api_key, cwd, debug=debug, verbose=verbose, headed=headed, max_effort=max_effort)
 
     # Pipe mode: suppress all non-report output
     if pipe_mode:
@@ -8443,6 +8449,7 @@ def main():
     )
     parser.add_argument("--fast", action="store_true", help="Use claude-opus-4.8-fast:online")
     parser.add_argument("--oraclepro", action="store_true", help="Use gpt-5.5-pro for oracle (default: gpt-5.5)")
+    parser.add_argument("--max-effort", action="store_true", help="Raise Fable reasoning effort to 'max' and GPT-5.5 oracle effort to 'high' (default: 'xhigh' for both)")
     parser.add_argument("--prompt", type=str, default=None, help="Inline prompt text")
     parser.add_argument("--cwd", type=str, default=".", help="Working directory for relative paths")
     parser.add_argument("--max-loops", type=int, default=MAX_LOOPS, help=f"Maximum agent loops (default: {MAX_LOOPS})")
@@ -8547,6 +8554,7 @@ def main():
             notify_email=getattr(args, 'notify_email', None),
             max_cost=getattr(args, 'max_cost', None),
             tui_mode=getattr(args, 'tui', False),
+            max_effort=getattr(args, 'max_effort', False),
         ))
     except KeyboardInterrupt:
         pass

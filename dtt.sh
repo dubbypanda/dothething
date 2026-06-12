@@ -112,8 +112,8 @@ Flags:
   --cwd DIR       Working directory for relative paths (default: .)
   --max-loops N   Maximum agent loop iterations (default: 200)
   --oraclepro     Use openai/gpt-5.5-pro for oracle (default: openai/gpt-5.5)
-  --max-effort    Raise Fable effort to 'max' and GPT-5.5 oracle to 'high'
-                  (default: 'xhigh' for both)
+  --max-effort    Pin the GPT-5.5 oracle to 'high' reasoning effort, its native
+                  ceiling (Fable always runs at 'xhigh', OpenRouter's maximum)
   --resume ID     Resume a previous thread by ID (from ~/.dtt/threads/).
                   Combine with --prompt or positional text, or just let the
                   editor open, to supply fresh instructions on resume.
@@ -3902,8 +3902,11 @@ class Agent:
         self.model = model
         self.oracle_model = oracle_model
         self.max_effort = max_effort
-        # --max-effort pushes Fable to "max" and GPT-5.5 (oracle) to "high"; otherwise both default to "xhigh".
-        self._model_effort = "max" if max_effort else "xhigh"
+        # OpenRouter's reasoning.effort enum tops out at "xhigh" — Anthropic's "max"
+        # tier isn't exposed and is rejected by schema validation — so Fable always
+        # runs at "xhigh". --max-effort pins the GPT-5.5 oracle to "high", its native
+        # ceiling, instead of relying on OpenRouter's normalization of "xhigh".
+        self._model_effort = "xhigh"
         self._oracle_effort = "high" if max_effort else "xhigh"
         self.api_key = api_key
         self.cwd = cwd
@@ -8449,7 +8452,7 @@ def main():
     )
     parser.add_argument("--fast", action="store_true", help="Use claude-opus-4.8-fast:online")
     parser.add_argument("--oraclepro", action="store_true", help="Use gpt-5.5-pro for oracle (default: gpt-5.5)")
-    parser.add_argument("--max-effort", action="store_true", help="Raise Fable reasoning effort to 'max' and GPT-5.5 oracle effort to 'high' (default: 'xhigh' for both)")
+    parser.add_argument("--max-effort", action="store_true", help="Pin the GPT-5.5 oracle to 'high' reasoning effort, its native ceiling (Fable always runs at 'xhigh', OpenRouter's maximum)")
     parser.add_argument("--prompt", type=str, default=None, help="Inline prompt text")
     parser.add_argument("--cwd", type=str, default=".", help="Working directory for relative paths")
     parser.add_argument("--max-loops", type=int, default=MAX_LOOPS, help=f"Maximum agent loops (default: {MAX_LOOPS})")

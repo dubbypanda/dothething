@@ -62,7 +62,7 @@ Everything else is installed automatically into `/tmp/dothething` on first run.
 | `--cwd DIR` | Set the working directory for file operations (default: `.`) |
 | `--max-loops N` | Cap the number of agent turns (default: 200) |
 | `--oraclepro` | Use GPT-5.5-pro instead of GPT-5.5 for oracle calls |
-| `--max-effort` | Raise Fable reasoning effort to `max` and the GPT-5.5 oracle to `high` (default: `xhigh` for both) |
+| `--max-effort` | Pin the GPT-5.5 oracle to `high` reasoning effort, its native ceiling (Fable always runs at `xhigh`, the highest OpenRouter accepts) |
 | `--resume ID` | Pick up a previous session by thread ID |
 | `--headed` | Show the browser window for visual debugging |
 | `--orchestrator` | Launch orchestrator mode -- run and manage multiple agents from one terminal |

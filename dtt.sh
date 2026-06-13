@@ -386,6 +386,9 @@ WORKER          = "google/gemini-3.5-flash"
 ORACLE_DEFAULT  = "openai/gpt-5.5:online"
 ORACLE_PRO      = "openai/gpt-5.5-pro:online"
 MAX_LOOPS       = 200
+# Usable context for history before the model starts losing room to answer:
+# the 1M window minus ~128k reserved for the response. Shown as "ctx %" per turn.
+CONTEXT_USABLE_TOKENS = 1_000_000 - 128_000
 DEFAULT_CMD_TIMEOUT = 300
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
 MAX_INLINE_BYTES = 5 * 1024 * 1024
@@ -4008,6 +4011,7 @@ class Agent:
     def __init__(self, model, oracle_model, api_key, cwd, debug=False, verbose=False, headed=False, max_effort=False):
         self.model = model
         self.oracle_model = oracle_model
+        self._ctx_tokens = 0  # last model-call prompt_tokens, for the context-depth meter
         self.max_effort = max_effort
         # OpenRouter's reasoning.effort enum tops out at "xhigh" — Anthropic's "max"
         # tier isn't exposed and is rejected by schema validation — so the main model always
@@ -7123,6 +7127,7 @@ class Agent:
                 usage = result.get("usage", {})
                 if usage:
                     prompt_tokens = usage.get("prompt_tokens", 0)
+                    self._ctx_tokens = prompt_tokens or self._ctx_tokens
                     completion_tokens = usage.get("completion_tokens", 0)
                     reasoning_tokens = usage.get("reasoning_tokens", 0)
                     inline_cost = usage.get("cost")
@@ -7296,8 +7301,12 @@ class Agent:
                 result_len=tok,
                 duration_sec=round(duration_sec, 3),
             )
+            ctx_pct = ""
+            if self._ctx_tokens:
+                pct = self._ctx_tokens / CONTEXT_USABLE_TOKENS * 100
+                ctx_pct = f"  [{'⚠ ' if pct >= 90 else ''}ctx {pct:.0f}%]"
             print(
-                f"  ⚡ {name}" + (f" → {brief}" if brief else "") + f"  [{tok:,} tok {tag}]",
+                f"  ⚡ {name}" + (f" → {brief}" if brief else "") + f"  [{tok:,} tok {tag}]" + ctx_pct,
                 file=sys.stderr,
             )
             if name in ("plan_create", "plan_completed", "plan_update", "plan_remaining"):

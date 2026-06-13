@@ -4594,7 +4594,9 @@ class Agent:
                     "model": self.oracle_model,
                     "messages": [{"role": "system", "content": system}] + msgs,
                     "temperature": 0.2,
-                    "max_tokens": 16384,
+                    # 128k headroom: hard problems can burn most of the budget on
+                    # reasoning before producing a visible answer.
+                    "max_tokens": 131072,
                     "reasoning": {"effort": self._oracle_effort},
                     "session_id": getattr(self, "_thread_id", "") + ":oracle",
                 },

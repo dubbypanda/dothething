@@ -131,7 +131,8 @@ Flags:
   --max-cost USD  Stop and checkpoint when cumulative cost reaches this amount
   --verbose       Verbose error traces
   --show-full     Stream the model's thinking live and show full, untruncated
-                  tool calls (disables the spinner; verbose firehose)
+                  tool calls as they start and finish (disables the spinner;
+                  verbose firehose — lets you see what a long tool is doing)
   --debug         Debug-level logging of API payloads
   --keep-temp     Keep the temp runtime directory on exit
   --version, -V   Print the dothething version and exit
@@ -2446,6 +2447,11 @@ TOOLS = [
             "description": (
                 "Execute a shell command via /bin/bash. Each invocation is a fresh shell — "
                 "environment and working directory do not persist between calls. "
+                "Blocks until the command exits or `timeout` (default 300s) fires; on timeout "
+                "the whole process group is SIGKILLed and you get exit_code -9 with no output. "
+                "For work that runs longer than you want to block on, launch it detached "
+                "(setsid … >\"$DTT_CACHE_DIR/job.log\" 2>&1 &) and poll its log in later calls "
+                "rather than blocking on a long while/sleep loop — see the background_jobs guidance. "
                 "For complex logic, write a script file first, then execute it. "
                 "Prefer read-only commands first; avoid destructive commands unless required."
             ),
@@ -3963,7 +3969,8 @@ pypdf, python-docx, openpyxl, tabulate, notte, rich, textual, agentmail
 
 Environment variables injected into run_code/run_command:
   SEARXNG_URL, DTT_SEARXNG_URL, DTT_SEARXNG_PORT, DTT_CWD, DTT_BASE, \
-DTT_THREAD_ID, TWOCAPTCHA_API_KEY (if set), OPENROUTER_API_KEY
+DTT_THREAD_ID, DTT_THREAD_DIR, DTT_CACHE_DIR (per-thread scratch dir — use it for \
+background-job log files), TWOCAPTCHA_API_KEY (if set), OPENROUTER_API_KEY
 
 For a task requiring form interaction:
   1. Use fetch_page to read the page first
@@ -3985,6 +3992,39 @@ fetch_page hundreds of times sequentially.
    - Spam is filtered by default (use include_spam=true to see it)
    - When reading emails, extracted_text/extracted_html give reply-ready content
 </infrastructure>
+
+<background_jobs>
+Long-running shell work — multi-minute sweeps, builds, training/optimization \
+runs, big compiles — needs care. run_command blocks until the command exits or \
+its timeout fires, and ON TIMEOUT the entire process group is SIGKILLed and you \
+get back exit_code -9 with NO output. So a long blocking wait that overruns \
+burns the whole timeout and teaches you nothing.
+
+If a command will plausibly finish within its timeout (default 300s; raise it \
+when you have a good estimate), just run it normally and block — that is the \
+simple, correct case. Background only when the work runs LONGER than you want to \
+sit blocked, or when you want to make progress on other things meanwhile.
+
+To background a job:
+- Launch it detached, logging to the per-thread cache dir, and return at once:
+    setsid bash -c 'your_heavy_command ...' >"$DTT_CACHE_DIR/job1.log" 2>&1 &
+    echo "pgid=$!"     # record this — it leads its own process group
+  Have the job announce completion as its last act so you can distinguish "done" \
+from "stalled" by reading the log, e.g. end the command with:
+    ; echo "=== JOB1 DONE rc=$? ==="
+- The job keeps running after run_command returns. The cache dir survives across \
+turns and --resume, so its log and any partial results are always there to read.
+
+To wait for it — DO NOT block one run_command on `while ...; do sleep 30; done` \
+with a big timeout. That is the trap above: it gets SIGKILLed at the timeout \
+(exit -9), so you wait the full interval and get nothing back. Instead POLL with \
+cheap, BOUNDED checks, one per turn:
+    kill -0 -<pgid> 2>/dev/null && echo RUNNING || echo DONE
+    tail -n 40 "$DTT_CACHE_DIR/job1.log"
+Each check returns in well under a second. Do other useful work between checks. \
+If there is genuinely nothing else to do, use a single bounded wait (≤60s) then \
+re-check — never one giant blocking wait. Kill a runaway with `kill -- -<pgid>`.
+</background_jobs>
 
 <self_management>
 You can manage your own configuration, skills, and tool connections when the user asks:
@@ -4468,6 +4508,19 @@ class Agent:
 
         return json.dumps(results, ensure_ascii=False, indent=2)
 
+    def _thread_dir_env(self):
+        """Env vars pointing at the per-thread dirs, injected into every shell
+        the agent spawns. Gives backgrounded jobs a durable, documented home for
+        log files (the cache dir survives across turns and --resume), so the
+        agent doesn't have to hard-code an absolute /root/.dtt/... path."""
+        tl = getattr(self, "thread_logger", None)
+        if tl is None:
+            return {}
+        return {
+            "DTT_THREAD_DIR": str(tl.thread_dir),
+            "DTT_CACHE_DIR": str(tl.cache_dir),
+        }
+
     async def _tool_run_command(self, command, cwd=None, timeout=None, stdin=None, env=None, **kw):
         timeout = timeout or DEFAULT_CMD_TIMEOUT
         run_cwd = resolve_path(self.cwd, cwd or ".")
@@ -4486,6 +4539,7 @@ class Agent:
         process_env["DTT_CWD"] = str(self.cwd)
         process_env["DTT_BASE"] = str(BASE)
         process_env["DTT_THREAD_ID"] = getattr(self, "_thread_id", "")
+        process_env.update(self._thread_dir_env())
         if os.environ.get("TWOCAPTCHA_API_KEY"):
             process_env["TWOCAPTCHA_API_KEY"] = os.environ["TWOCAPTCHA_API_KEY"]
         if os.environ.get("OPENROUTER_API_KEY"):
@@ -5176,6 +5230,7 @@ class Agent:
         env["DTT_CWD"] = str(self.cwd)
         env["DTT_BASE"] = str(BASE)
         env["DTT_THREAD_ID"] = getattr(self, "_thread_id", "")
+        env.update(self._thread_dir_env())
         if os.environ.get("TWOCAPTCHA_API_KEY"):
             env["TWOCAPTCHA_API_KEY"] = os.environ["TWOCAPTCHA_API_KEY"]
         if os.environ.get("OPENROUTER_API_KEY"):
@@ -6342,6 +6397,7 @@ class Agent:
         env["TERM"] = "dumb"
         env["PS1"] = ""
         env["DEBIAN_FRONTEND"] = "noninteractive"
+        env.update(self._thread_dir_env())
         if self.searxng and self.searxng.url:
             env["SEARXNG_URL"] = self.searxng.url
 
@@ -7317,6 +7373,16 @@ class Agent:
                     brief = (s[:69] + "…") if len(s) > 70 else s
                 break
             self.spinner.update(f"⚡ {name}" + (f" → {brief}" if brief else ""))
+            if self._show_full:
+                # The spinner is disabled in show-full mode, so without this the
+                # user sees nothing while a long tool runs (a blocking run_command
+                # waiting on a background job, an oracle call, a sweep). Print what
+                # is STARTING so the firehose shows current activity, not just
+                # completed calls. The post-completion line below adds timing.
+                sys.stderr.write(
+                    "  ⚡ " + name + (f" → {brief}" if brief else "") + "  […running]\n"
+                )
+                sys.stderr.flush()
             self.events.emit("tool_start", name=name, args=brief)
 
             # Track secret request_user_input calls for redaction
@@ -7356,6 +7422,9 @@ class Agent:
                 final = raw
             elif result_mode and result_mode.lower() != "raw":
                 self.spinner.update(f"📝 Summarizing {name}…")
+                if self._show_full:
+                    sys.stderr.write(f"  📝 Summarizing {name}…\n")
+                    sys.stderr.flush()
                 final = await smart_summarize(
                     raw, result_mode, self.headers, self.cost_tracker, self.http,
                     tool_name=name
@@ -8669,7 +8738,7 @@ def main():
     parser.add_argument("--resume", type=str, default=None, metavar="THREAD_ID", help="Resume a previous thread, inheriting its saved config (model, oracle, max-loops, max-effort, cwd) unless overridden. Optionally combine with --prompt or positional text for fresh instructions")
     parser.add_argument("--headed", action="store_true", help="Show the browser window for visual debugging")
     parser.add_argument("--verbose", action="store_true", help="Verbose error traces")
-    parser.add_argument("--show-full", action="store_true", help="Stream the model's thinking live and show full, untruncated tool calls (disables the spinner; a verbose firehose for watching/debugging a run)")
+    parser.add_argument("--show-full", action="store_true", help="Stream the model's thinking live and show full, untruncated tool calls as they start and finish (disables the spinner; a verbose firehose for watching/debugging a run — lets you see what a long-running tool is currently doing)")
     parser.add_argument("--debug", action="store_true", help="Debug-level API payload logging")
     parser.add_argument("--orchestrator", action="store_true", help="Launch orchestrator mode (manage multiple parallel agents)")
     parser.add_argument("--pipe", action="store_true", help="Pipe mode: final report to stdout, everything else suppressed")

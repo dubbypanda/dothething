@@ -117,6 +117,8 @@ Flags:
   --resume ID     Resume a previous thread by ID (from ~/.dtt/threads/).
                   Combine with --prompt or positional text, or just let the
                   editor open, to supply fresh instructions on resume.
+                  Inherits the thread's saved config (model, oracle, --max-loops,
+                  --max-effort, --cwd); pass a flag explicitly to override it.
   --headed        Show the browser window for visual debugging
   --orchestrator  Launch orchestrator mode (manage multiple parallel agents)
   --pipe          Pipe mode: only final report on stdout, all other output suppressed
@@ -6557,9 +6559,12 @@ class Agent:
             self._thread_totals_after_run = dict(self._thread_totals_before_run)
             self._thread_totals_persisted = False
             if resume_messages:
-                existing_meta.setdefault("model", self.model)
-                existing_meta.setdefault("oracle_model", self.oracle_model)
-                existing_meta.setdefault("cwd", str(self.cwd))
+                # Persist the effective run config so the next resume inherits it.
+                existing_meta["model"] = self.model
+                existing_meta["oracle_model"] = self.oracle_model
+                existing_meta["cwd"] = str(self.cwd)
+                existing_meta["max_loops"] = max_loops
+                existing_meta["max_effort"] = self.max_effort
                 existing_meta.setdefault("thread_id", thread_id)
                 existing_meta["resumed_at"] = now.isoformat()
                 fresh = (prompt or "").strip()
@@ -6574,6 +6579,8 @@ class Agent:
                     "model": self.model,
                     "oracle_model": self.oracle_model,
                     "cwd": str(self.cwd),
+                    "max_loops": max_loops,
+                    "max_effort": self.max_effort,
                     "prompt": prompt,
                     "started_at": now.isoformat(),
                     "thread_id": thread_id,
@@ -8551,7 +8558,7 @@ def main():
     parser.add_argument("--prompt", type=str, default=None, help="Inline prompt text")
     parser.add_argument("--cwd", type=str, default=".", help="Working directory for relative paths")
     parser.add_argument("--max-loops", type=int, default=MAX_LOOPS, help=f"Maximum agent loops (default: {MAX_LOOPS})")
-    parser.add_argument("--resume", type=str, default=None, metavar="THREAD_ID", help="Resume a previous thread (optionally combine with --prompt or positional text for fresh instructions)")
+    parser.add_argument("--resume", type=str, default=None, metavar="THREAD_ID", help="Resume a previous thread, inheriting its saved config (model, oracle, max-loops, max-effort, cwd) unless overridden. Optionally combine with --prompt or positional text for fresh instructions")
     parser.add_argument("--headed", action="store_true", help="Show the browser window for visual debugging")
     parser.add_argument("--verbose", action="store_true", help="Verbose error traces")
     parser.add_argument("--debug", action="store_true", help="Debug-level API payload logging")
@@ -8578,6 +8585,32 @@ def main():
     model = OPUS_FAST if args.fast else OPUS
     oracle_model = ORACLE_PRO if args.oraclepro else ORACLE_DEFAULT
     cwd = str(Path(args.cwd).expanduser().resolve())
+    max_loops = args.max_loops
+    max_effort = getattr(args, 'max_effort', False)
+
+    # On resume, inherit the thread's saved run config unless explicitly overridden
+    # on the CLI (so `dtt --resume ID` picks up where it left off, same settings).
+    if args.resume:
+        try:
+            _rmeta = ThreadLogger(thread_id=args.resume).load_meta() or {}
+        except Exception:
+            _rmeta = {}
+        def _passed(flag):
+            return any(a == flag or a.startswith(flag + "=") for a in sys.argv)
+        if not _passed("--fast") and _rmeta.get("model") == OPUS_FAST:
+            model = OPUS_FAST
+        if not _passed("--oraclepro") and _rmeta.get("oracle_model") == ORACLE_PRO:
+            oracle_model = ORACLE_PRO
+        if not _passed("--cwd") and _rmeta.get("cwd"):
+            cwd = str(Path(_rmeta["cwd"]).expanduser().resolve())
+        if not _passed("--max-loops") and _rmeta.get("max_loops"):
+            max_loops = _rmeta["max_loops"]
+        if not _passed("--max-effort") and _rmeta.get("max_effort"):
+            max_effort = True
+        if _rmeta:
+            print(f"    Inherited config: {'fast' if model == OPUS_FAST else 'standard'} model, "
+                  f"{'pro' if oracle_model == ORACLE_PRO else 'standard'} oracle, "
+                  f"max_loops={max_loops}, max_effort={max_effort}, cwd={cwd}", file=sys.stderr)
 
     # Early pipe mode validation (before orchestrator or prompt collection)
     if getattr(args, 'pipe', False):
@@ -8639,7 +8672,7 @@ def main():
             oracle_model=oracle_model,
             api_key=api_key,
             cwd=cwd,
-            max_loops=args.max_loops,
+            max_loops=max_loops,
             debug=args.debug,
             verbose=args.verbose,
             headed=args.headed,
@@ -8652,7 +8685,7 @@ def main():
             notify_email=getattr(args, 'notify_email', None),
             max_cost=getattr(args, 'max_cost', None),
             tui_mode=getattr(args, 'tui', False),
-            max_effort=getattr(args, 'max_effort', False),
+            max_effort=max_effort,
         ))
     except KeyboardInterrupt:
         pass

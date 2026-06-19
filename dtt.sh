@@ -3140,7 +3140,7 @@ TOOLS = [
                 "fills forms, solves CAPTCHAs, and interacts with web pages to achieve a goal. "
                 "Use when simple page fetching isn't enough — logging in, filling multi-step forms, "
                 "navigating SPAs, interacting with dynamic content, or any task requiring multiple "
-                "browser actions. The agent uses Sonnet 4.6 for reasoning and Camoufox (stealth Firefox) "
+                "browser actions. The agent uses Opus 4.8 for reasoning and Camoufox (stealth Firefox) "
                 "for browsing. Returns when the goal is achieved or it gives up. More expensive than "
                 "fetch_page — use only when interaction is required."
             ),
@@ -3725,9 +3725,9 @@ without browser rendering. Use mode="screenshot" + analyze_image for visual cont
 and inspect challenge_detected/challenge_unresolved in screenshot results. DO NOT use for interactive \
 tasks — use browser_agent for those.
 - browser_agent: Hands a goal to an autonomous browser agent (Notte + Camoufox \
-+ Sonnet 4.6). Use for multi-step web interactions: filling forms, login flows, \
++ Opus 4.8). Use for multi-step web interactions: filling forms, login flows, \
 navigating SPAs, clicking through menus, handling CAPTCHAs that auto-solving \
-can't handle. More expensive than fetch_page (uses Sonnet for each step). \
+can't handle. More expensive than fetch_page (uses Opus for each step). \
 DO NOT use for simple page reads.
 - glob: use ** for recursive. Returns file metadata (size, count).
 - http_request: use for REST APIs, JSON endpoints, file downloads, POST \
@@ -3969,7 +3969,7 @@ Thread cache: {cache_dir}
 SearXNG: {searxng_info}
 Notte: Browser framework with stealth Camoufox, content extraction, and captcha solving.
   - fetch_page for deterministic scraping (no LLM cost)
-  - browser_agent for interactive multi-step browsing (uses Sonnet 4.6)
+  - browser_agent for interactive multi-step browsing (uses Opus 4.8)
   - Available as Python library: import notte
 Python venv: {venv_path}
 </context>

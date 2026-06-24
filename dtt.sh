@@ -3,7 +3,7 @@
 # https://github.com/fluffypony/dothething | https://dotheth.ing
 set -euo pipefail
 
-DTT_VERSION="2.1.7"
+DTT_VERSION="2.1.8"
 _dtt_s="$0"
 [[ "$_dtt_s" != */* ]] && _dtt_s="$(command -v "$_dtt_s" 2>/dev/null || echo "$_dtt_s")"
 DTT_SELF="$(realpath "$_dtt_s" 2>/dev/null || echo "$(cd "$(dirname "$_dtt_s")" && pwd -P)/$(basename "$_dtt_s")")"
@@ -302,11 +302,11 @@ if [ ! -f "$DTT_CACHE/.searxng_v4" ]; then
 fi
 
 # ── Notte browser framework ────────────────────────────────────
-if [ ! -f "$DTT_CACHE/.notte_v2" ]; then
-    echo "▸ Installing Notte browser framework (first run)..."
-    pip install -q "notte[camoufox,captcha] @ git+https://github.com/fluffypony/notte.git" || { echo "✗ Notte install failed" >&2; exit 1; }
+if [ ! -f "$DTT_CACHE/.notte_v3" ]; then
+    echo "▸ Installing/updating Notte browser framework..."
+    pip install -q --upgrade --force-reinstall --no-cache-dir "notte[camoufox,captcha] @ git+https://github.com/fluffypony/notte.git@main" || { echo "✗ Notte install failed" >&2; exit 1; }
     python -m camoufox fetch || { echo "✗ Camoufox browser fetch failed" >&2; exit 1; }
-    touch "$DTT_CACHE/.notte_v2"
+    touch "$DTT_CACHE/.notte_v3"
 fi
 
 # Playwright 1.60's Firefox driver can crash when Firefox reports a page error
@@ -339,7 +339,7 @@ cat > "$BASE/agent.py" << 'PYTHON_AGENT'
 import os, sys, json, time, asyncio, subprocess, socket, re, atexit, signal
 import threading, argparse, shlex, shutil, traceback, copy
 import fnmatch, difflib, hashlib, base64, mimetypes, uuid
-import tempfile, contextlib
+import tempfile, contextlib, concurrent.futures
 from pathlib import Path
 from datetime import datetime, timezone
 from urllib.parse import urlsplit, urlunsplit
@@ -839,6 +839,53 @@ class FetchCache:
         path = self.cache_dir / f"{k}.json"
         path.write_text(json.dumps({"ts": time.time(), "content": content}))
 
+def _cookie_key(cookie):
+    return (
+        str(cookie.get("domain") or cookie.get("url") or ""),
+        str(cookie.get("path") or "/"),
+        str(cookie.get("name") or ""),
+    )
+
+def _merge_browser_cookies(cookie_file, cookies):
+    """Persist cookies without unbounded duplicate growth across tool calls."""
+    if not cookie_file or not cookies:
+        return
+    path = Path(cookie_file)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing = []
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                existing = [c for c in data if isinstance(c, dict)]
+        except Exception:
+            existing = []
+
+    merged = {}
+    order = []
+    for cookie in existing + [c for c in cookies if isinstance(c, dict)]:
+        key = _cookie_key(cookie)
+        if not key[2]:
+            continue
+        if key not in merged:
+            order.append(key)
+        merged[key] = cookie
+
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(
+        json.dumps([merged[k] for k in order], ensure_ascii=False),
+        encoding="utf-8",
+    )
+    try:
+        os.chmod(tmp, 0o600)
+    except Exception:
+        pass
+    tmp.replace(path)
+    try:
+        os.chmod(path, 0o600)
+    except Exception:
+        pass
+
 # ═══════════════════════════════════════════════════════════════════
 # Browser — Notte + Camoufox
 # ═══════════════════════════════════════════════════════════════════
@@ -855,11 +902,31 @@ class Browser:
         "initializing", "spinner", "skeleton",
     ]
 
-    def __init__(self, headless=True):
+    def __init__(self, headless=True, cookie_file=None):
         self._session = None
         self._lock = asyncio.Lock()
         self._fetch_lock = asyncio.Lock()
         self._headless = headless
+        self._cookie_file = Path(cookie_file) if cookie_file else None
+
+    def set_cookie_file(self, cookie_file):
+        self._cookie_file = Path(cookie_file) if cookie_file else None
+
+    async def _load_cookies(self, session):
+        if not self._cookie_file or not self._cookie_file.exists():
+            return
+        try:
+            await session.aset_cookies(cookie_file=self._cookie_file)
+        except Exception:
+            pass
+
+    async def _save_cookies(self, session):
+        if not self._cookie_file:
+            return
+        try:
+            _merge_browser_cookies(self._cookie_file, await session.aget_cookies())
+        except Exception:
+            pass
 
     async def _ensure(self):
         async with self._lock:
@@ -875,6 +942,7 @@ class Browser:
                     viewport_height=DEFAULT_HEADLESS_VIEWPORT_HEIGHT,
                 )
                 await self._session.__aenter__()
+                await self._load_cookies(self._session)
         return self._session
 
     @staticmethod
@@ -1015,7 +1083,8 @@ class Browser:
         }
 
     async def fetch(self, url, mode="markdown", screenshot_region="above",
-                    timeout_ms=45000, extract_selector=None, wait_for=None):
+                    timeout_ms=45000, extract_selector=None, wait_for=None,
+                    screenshot_dir=None):
         async with self._fetch_lock:
           try:
             session = await self._ensure()
@@ -1024,6 +1093,7 @@ class Browser:
                 self._session = None
             return f"Error launching browser: {e}"
           try:
+            await self._load_cookies(session)
             result = await session.aexecute(type="goto", url=url)
             if not result.success:
                 return f"Error navigating to {url}: {result.message}"
@@ -1057,12 +1127,15 @@ class Browser:
                     await page.wait_for_timeout(200)
                     data = await page.screenshot(full_page=False)
                 ts = int(time.time() * 1000)
-                path = Path(f"screenshot_{ts}.png").absolute()
+                out_dir = Path(screenshot_dir) if screenshot_dir else Path.cwd()
+                out_dir.mkdir(parents=True, exist_ok=True)
+                path = (out_dir / f"screenshot_{ts}.png").absolute()
                 path.write_bytes(data)
                 return json.dumps({
                     "type": "screenshot", "url": str(page.url),
                     "path": str(path), "region": screenshot_region,
                     "size_bytes": len(data),
+                    "tip": "Use analyze_image with this path to interpret the screenshot pixels.",
                     "challenge_detected": bool(settle.get("challenge_seen")),
                     "challenge_unresolved": bool(settle.get("challenge")),
                     "captcha_solve_attempted": bool(settle.get("solve_attempted")),
@@ -1109,6 +1182,8 @@ class Browser:
             async with self._lock:
                 self._session = None
             return f"Error fetching {url}: {e}"
+          finally:
+            await self._save_cookies(session)
 
     async def close(self):
         async with self._lock:
@@ -4164,6 +4239,13 @@ class Agent:
         self.messages = []
         self.searxng = SearXNG()
         self.browser = Browser(headless=not headed)
+        self._browser_cookie_file = None
+        self._browser_agent_session = None
+        self._browser_agent_lock = asyncio.Lock()
+        self._browser_agent_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="dtt-browser-agent",
+        )
         self.fetch_cache = FetchCache()
         self.cost_tracker = CostTracker(api_key)
         self.plan = Plan()
@@ -4778,9 +4860,11 @@ class Agent:
                 return f"[CACHED CONTENT — source: {url}]\n\n{cached}"
 
         try:
+            screenshot_dir = self.thread_logger.cache_dir if self.thread_logger else None
             result = await self.browser.fetch(url, mode, screenshot_region, timeout_ms,
                                               extract_selector=extract_selector,
-                                              wait_for=wait_for)
+                                              wait_for=wait_for,
+                                              screenshot_dir=screenshot_dir)
 
             if mode in ("markdown", "html") and not result.startswith("Error"):
                 self.fetch_cache.put(result, *cache_key)
@@ -5744,18 +5828,30 @@ class Agent:
         self._browser_agent_used = True
         max_steps = max(1, min(int(max_steps or 20), 50))
         headed = self.headed
+        cookie_file = self._browser_cookie_file
 
         def _run():
             import notte
             _configure_redacted_loguru_logging()
-            with notte.Session(
-                headless=not headed,
-                browser_type="camoufox",
-                solve_captchas=bool(os.environ.get("TWOCAPTCHA_API_KEY")),
-                perception_type="fast",
-                viewport_width=DEFAULT_HEADLESS_VIEWPORT_WIDTH,
-                viewport_height=DEFAULT_HEADLESS_VIEWPORT_HEIGHT,
-            ) as session:
+            if self._browser_agent_session is None:
+                session = notte.Session(
+                    headless=not headed,
+                    browser_type="camoufox",
+                    solve_captchas=bool(os.environ.get("TWOCAPTCHA_API_KEY")),
+                    perception_type="fast",
+                    viewport_width=DEFAULT_HEADLESS_VIEWPORT_WIDTH,
+                    viewport_height=DEFAULT_HEADLESS_VIEWPORT_HEIGHT,
+                )
+                session.__enter__()
+                self._browser_agent_session = session
+
+            session = self._browser_agent_session
+            if cookie_file and Path(cookie_file).exists():
+                try:
+                    session.set_cookies(cookie_file=cookie_file)
+                except Exception:
+                    pass
+            try:
                 if url:
                     nav = session.execute(type="goto", url=url)
                     if not nav.success:
@@ -5775,15 +5871,31 @@ class Agent:
                 except Exception:
                     pass
                 return result_text
+            finally:
+                if cookie_file:
+                    try:
+                        _merge_browser_cookies(cookie_file, session.get_cookies())
+                    except Exception:
+                        pass
 
         self.spinner.update(f"Browser agent working: {task[:50]}...")
-        try:
-            result = await asyncio.to_thread(_run)
-            return f"[Browser agent result — task: {task}]\n\n{result}"
-        except Exception as e:
-            if self.verbose:
-                traceback.print_exc()
-            return f"Browser agent error: {e}"
+        reset_session = False
+        error_text = None
+        async with self._browser_agent_lock:
+            try:
+                loop = asyncio.get_running_loop()
+                result = await loop.run_in_executor(self._browser_agent_executor, _run)
+                return f"[Browser agent result — task: {task}]\n\n{result}"
+            except Exception as e:
+                if self.verbose:
+                    traceback.print_exc()
+                err = str(e)
+                if "closed" in err.lower() or "target" in err.lower():
+                    reset_session = True
+                error_text = f"Browser agent error: {e}"
+        if reset_session:
+            await self._close_browser_agent_session()
+        return error_text
 
     # ── Self-config management tools ─────────────────────────────
     async def _tool_manage_config(self, action, key=None, value=None, **kw):
@@ -6680,6 +6792,9 @@ class Agent:
             if self.thread_logger
             else "(unavailable)"
         )
+        if self.thread_logger:
+            self._browser_cookie_file = self.thread_logger.cache_dir / "browser_cookies.json"
+            self.browser.set_cookie_file(self._browser_cookie_file)
         self._base_system_prompt = SYSTEM_PROMPT.format(
             cwd=self.cwd,
             platform=f"{plat.system()} {plat.machine()}",
@@ -7464,7 +7579,13 @@ class Agent:
                             raw += f"\n{traceback.format_exc()}"
 
             # Apply result_mode: raw or summarize
-            if name in ("finalize", "think"):
+            if name == "fetch_page" and str(args.get("mode") or "").lower() == "screenshot":
+                # Screenshot fetches return JSON metadata containing the PNG path.
+                # Summarizing that text cannot inspect pixels and can hallucinate
+                # page content. The agent should pass the path to analyze_image.
+                result_mode = "raw"
+                final = raw
+            elif name in ("finalize", "think"):
                 final = raw
             elif result_mode and result_mode.lower() != "raw":
                 self.spinner.update(f"📝 Summarizing {name}…")
@@ -7652,6 +7773,30 @@ class Agent:
             print("    (Note: browser_agent LLM calls via Notte are not included in this total.)", file=sys.stderr)
         print(f"{'━' * 58}", file=sys.stderr)
 
+    async def _close_browser_agent_session(self):
+        async with self._browser_agent_lock:
+            if self._browser_agent_session is None:
+                return
+
+            def _close():
+                session = self._browser_agent_session
+                self._browser_agent_session = None
+                try:
+                    if self._browser_cookie_file:
+                        _merge_browser_cookies(
+                            self._browser_cookie_file,
+                            session.get_cookies(),
+                        )
+                except Exception:
+                    pass
+                try:
+                    session.__exit__(None, None, None)
+                except Exception:
+                    pass
+
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(self._browser_agent_executor, _close)
+
     # ── Cleanup ──────────────────────────────────────────────────
     async def cleanup(self):
         self.input_handler.stop()
@@ -7671,6 +7816,8 @@ class Agent:
             except Exception:
                 pass
         self.searxng.stop()
+        await self._close_browser_agent_session()
+        self._browser_agent_executor.shutdown(wait=False, cancel_futures=True)
         await self.browser.close()
         await self.mcp_manager.stop()
         print("  ⏳ Fetching cost data…", file=sys.stderr)

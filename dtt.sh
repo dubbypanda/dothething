@@ -999,8 +999,10 @@ Registered once per upstream in the generated settings.yml:
       timeout: 30.0
 
 Caveat: an upstream whose request() fetches a token by calling searx.network
-itself (duckduckgo's vqd) makes that preflight directly, not through the
-browser. Only the SERP fetch is bridged.
+itself makes that preflight directly, not through the browser — only the SERP
+fetch is bridged. Startpage's sc_code and DuckDuckGo's vqd both work this way,
+so those engines can still be walled at the preflight even though the search
+itself would have gone through fine.
 """
 
 from json import loads
@@ -1063,6 +1065,19 @@ def setup(engine_data):
     time_range_support = bool(getattr(_engine, "time_range_support", time_range_support))
     safesearch = bool(getattr(_engine, "safesearch", safesearch))
     language_support = bool(getattr(_engine, "language_support", language_support))
+
+    # Re-export the upstream's init(). load_engine() does not call it — the
+    # search processor does, on whichever engine got registered, which is this
+    # module. Without this the upstream's module-level state is never set up
+    # and its request() dies on first use (startpage: NameError on CACHE).
+    # Exposed rather than called here so it still runs where the processor
+    # intends: in its own thread, with the engine's network configured. Only
+    # defined when the upstream has one, since the processor treats the
+    # attribute's presence as "this engine needs initialising".
+    upstream_init = getattr(_engine, "init", None)
+    if callable(upstream_init):
+        globals()["init"] = upstream_init
+
     return True
 
 
@@ -1861,20 +1876,28 @@ class Browser:
                     page = session.window.page
                     await self._settle_page(session, page, min(timeout_ms, 20000))
 
-                payload = await page.evaluate(
-                    """async (target) => {
-                        try {
-                            const r = await fetch(target, {
-                                credentials: "include",
-                                redirect: "follow",
-                            });
-                            return {ok: true, status: r.status, url: r.url,
-                                    text: await r.text()};
-                        } catch (e) {
-                            return {ok: false, error: String(e)};
-                        }
-                    }""",
-                    url,
+                # Bounded on both sides: SearXNG gives up on the engine at its
+                # own timeout, and a fetch still running after that would pin
+                # this session out of the pool for every later search.
+                budget = max(5000, min(timeout_ms, 60000))
+                payload = await asyncio.wait_for(
+                    page.evaluate(
+                        """async ([target, budget]) => {
+                            try {
+                                const r = await fetch(target, {
+                                    credentials: "include",
+                                    redirect: "follow",
+                                    signal: AbortSignal.timeout(budget),
+                                });
+                                return {ok: true, status: r.status, url: r.url,
+                                        text: await r.text()};
+                            } catch (e) {
+                                return {ok: false, error: String(e)};
+                            }
+                        }""",
+                        [url, budget],
+                    ),
+                    timeout=(budget / 1000) + 5,
                 )
                 if not payload.get("ok"):
                     raise RuntimeError(payload.get("error") or "fetch failed")

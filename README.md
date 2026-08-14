@@ -76,8 +76,7 @@ Everything else is installed automatically into `/tmp/dothething` on first run.
 | `--max-loops N` | Cap the number of agent turns (default: 200; 15 in quick mode) |
 | `--oraclepro` | Use GPT-5.6 Sol Pro instead of GPT-5.6 Sol for oracle calls |
 | `--model [ROLE=]SLUG` | Override the model for a role: `main`, `worker`, `oracle`, or `browser`. Repeatable. A bare slug targets `main`; `ROLE=default` clears a saved or env override |
-| `--max-effort` | Pin the GPT-5.5 oracle to `high` reasoning effort, its native ceiling (Fable always runs at `xhigh`, the highest OpenRouter accepts) |
-| `--resume ID` | Pick up a previous session by thread ID. Inherits that thread's saved config (model, oracle, `--max-loops`, `--max-effort`, `--cwd`); pass a flag to override it |
+| `--resume ID` | Pick up a previous session by thread ID. Inherits that thread's saved config (model, oracle, `--max-loops`, `--cwd`); pass a flag to override it |
 | `--headed` | Show the browser window for visual debugging |
 | `--orchestrator` | Launch orchestrator mode -- run and manage multiple agents from one terminal |
 | `--pipe` | Stdout-only output for Unix pipelines. Final report on stdout, everything else suppressed. Exit codes: 0=complete, 2=partial, 1=failed |
@@ -142,6 +141,10 @@ All calls route through OpenRouter. You only need one API key.
 | Summarizer, analysis, delegate (`worker`) | Google Gemini 3.5 Flash | `--model worker=...` |
 | Browser agent, Notte (`browser`) | Claude Sonnet 4.6 | `--model browser=...` |
 | Oracle (`oracle`) | GPT-5.6 Sol | `--oraclepro` for GPT-5.6 Sol Pro (not exposed in quick mode) |
+
+### Reasoning effort
+
+The main agent runs at `xhigh`. The oracle runs at `max`, the top of OpenRouter's scale, on the grounds that it only gets called on the problems the agent is already stuck on, so the extra thinking is cheap at that call volume. Quick mode drops the main agent to `medium`, which is most of where its speed comes from.
 
 ### Model overrides
 

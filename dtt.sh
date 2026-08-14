@@ -179,7 +179,7 @@ dothething — autonomous AI agent | https://dotheth.ing
 
 Usage:
   ./dtt.sh [q] [--fast] [--prompt "..."] [--cwd DIR] [--max-loops N]
-           [--oraclepro] [--max-effort] [--model [ROLE=]SLUG]
+           [--oraclepro] [--model [ROLE=]SLUG]
            [--headed] [--orchestrator]
            [--verbose] [--debug] [--keep-temp] [--resume THREAD_ID]
            [--version] [--update] [--install] [--pipe] [--tui]
@@ -206,8 +206,6 @@ Flags:
   --cwd DIR       Working directory for relative paths (default: .)
   --max-loops N   Maximum agent loop iterations (default: 200)
   --oraclepro     Use openai/gpt-5.6-sol-pro for oracle (default: openai/gpt-5.6-sol)
-  --max-effort    Pin the GPT-5.5 oracle to 'high' reasoning effort, its native
-                  ceiling (Fable always runs at 'xhigh', OpenRouter's maximum)
   --model [ROLE=]SLUG
                   Override the model for one role; repeat for several. Roles:
                   main (the agent), worker (summaries/delegation/batch),
@@ -222,7 +220,7 @@ Flags:
                   Combine with --prompt or positional text, or just let the
                   editor open, to supply fresh instructions on resume.
                   Inherits the thread's saved config (model, oracle, --max-loops,
-                  --max-effort, --cwd); pass a flag explicitly to override it.
+                  --cwd); pass a flag explicitly to override it.
   --headed        Show the browser window for visual debugging
   --orchestrator  Launch orchestrator mode (manage multiple parallel agents)
   --pipe          Pipe mode: only final report on stdout, all other output suppressed
@@ -4582,11 +4580,10 @@ class Agent:
         "shell_session":       "_tool_shell_session",
     }
 
-    def __init__(self, model, oracle_model, api_key, cwd, debug=False, verbose=False, headed=False, max_effort=False, quick=False):
+    def __init__(self, model, oracle_model, api_key, cwd, debug=False, verbose=False, headed=False, quick=False):
         self.model = model
         self.oracle_model = oracle_model
         self._ctx_tokens = 0  # last model-call prompt_tokens, for the context-depth meter
-        self.max_effort = max_effort
         self.quick = quick
         # Effective per-role model overrides (set by run_agent; persisted in
         # thread meta so --resume reproduces them).
@@ -4594,14 +4591,16 @@ class Agent:
         # Quick mode exposes a lean toolset (see QUICK_EXCLUDED_TOOLS).
         self._tools = QUICK_TOOLS if quick else TOOLS
         self._show_full = False  # --show-full: stream thinking live + show untruncated tool calls
-        # OpenRouter's reasoning.effort enum tops out at "xhigh" — Anthropic's "max"
-        # tier isn't exposed and is rejected by schema validation — so Fable always
-        # runs at "xhigh". --max-effort pins the GPT-5.5 oracle to "high", its native
-        # ceiling, instead of relying on OpenRouter's normalization of "xhigh".
-        # Quick mode trades reasoning depth for latency: "medium" cuts thinking
-        # time dramatically and is plenty for one-shot lookups and actions.
+        # OpenRouter's reasoning.effort enum tops out at "max", one rung above
+        # "xhigh" (none/minimal/low/medium/high/xhigh/max). The oracle is called
+        # sparingly, on the problems the main agent is already stuck on, so it
+        # gets "max" — at that call volume the extra thinking is cheap. The main
+        # agent runs every turn, where the same setting would cost far more in
+        # latency than it buys back, so it sits at "xhigh". Quick mode trades
+        # depth for latency: "medium" cuts thinking time dramatically and is
+        # plenty for one-shot lookups and actions.
         self._model_effort = "medium" if quick else "xhigh"
-        self._oracle_effort = "high" if max_effort else "xhigh"
+        self._oracle_effort = "max"
         self.api_key = api_key
         self.cwd = cwd
         self.debug = debug
@@ -7309,7 +7308,6 @@ class Agent:
                 existing_meta["oracle_model"] = self.oracle_model
                 existing_meta["cwd"] = str(self.cwd)
                 existing_meta["max_loops"] = max_loops
-                existing_meta["max_effort"] = self.max_effort
                 existing_meta["quick"] = self.quick
                 existing_meta["model_overrides"] = self._model_overrides
                 existing_meta.setdefault("thread_id", thread_id)
@@ -7327,7 +7325,6 @@ class Agent:
                     "oracle_model": self.oracle_model,
                     "cwd": str(self.cwd),
                     "max_loops": max_loops,
-                    "max_effort": self.max_effort,
                     "quick": self.quick,
                     "model_overrides": self._model_overrides,
                     "prompt": prompt,
@@ -8514,9 +8511,9 @@ async def run_agent(prompt, model, oracle_model, api_key, cwd, max_loops,
                     debug, verbose, headed=False, resume_id=None, worker_mode=False,
                     control_file=None, searxng_url=None, pipe_mode=False,
                     notify_desktop=False, notify_email=None, max_cost=None,
-                    tui_mode=False, max_effort=False, show_full=False, quick=False,
+                    tui_mode=False, show_full=False, quick=False,
                     model_overrides=None):
-    agent = Agent(model, oracle_model, api_key, cwd, debug=debug, verbose=verbose, headed=headed, max_effort=max_effort, quick=quick)
+    agent = Agent(model, oracle_model, api_key, cwd, debug=debug, verbose=verbose, headed=headed, quick=quick)
     agent._model_overrides = dict(model_overrides or {})
     agent._show_full = show_full
     if show_full:
@@ -9447,12 +9444,11 @@ def main():
                              "A bare slug targets main. Repeatable. ROLE=default clears a saved/env "
                              "override. Takes precedence over q/--fast/--oraclepro defaults; persists "
                              "across --resume; DTT_MODEL_<ROLE> env vars do the same with lower precedence.")
-    parser.add_argument("--max-effort", action="store_true", help="Pin the GPT-5.5 oracle to 'high' reasoning effort, its native ceiling (Fable always runs at 'xhigh', OpenRouter's maximum)")
     parser.add_argument("--prompt", type=str, default=None, help="Inline prompt text")
     parser.add_argument("--cwd", type=str, default=".", help="Working directory for relative paths")
     parser.add_argument("--max-loops", type=int, default=None,
                         help=f"Maximum agent loops (default: {MAX_LOOPS}, quick mode: {QUICK_MAX_LOOPS})")
-    parser.add_argument("--resume", type=str, default=None, metavar="THREAD_ID", help="Resume a previous thread, inheriting its saved config (model, oracle, max-loops, max-effort, cwd) unless overridden. Optionally combine with --prompt or positional text for fresh instructions")
+    parser.add_argument("--resume", type=str, default=None, metavar="THREAD_ID", help="Resume a previous thread, inheriting its saved config (model, oracle, max-loops, cwd) unless overridden. Optionally combine with --prompt or positional text for fresh instructions")
     parser.add_argument("--headed", action="store_true", help="Show the browser window for visual debugging")
     parser.add_argument("--verbose", action="store_true", help="Verbose error traces")
     parser.add_argument("--show-full", action="store_true", help="Stream the model's thinking live and show full, untruncated tool calls as they start and finish (disables the spinner; a verbose firehose for watching/debugging a run — lets you see what a long-running tool is currently doing)")
@@ -9497,7 +9493,6 @@ def main():
     oracle_model = ORACLE_PRO if args.oraclepro else ORACLE_DEFAULT
     cwd = str(Path(args.cwd).expanduser().resolve())
     max_loops = args.max_loops  # None until defaulted below (after resume inherit)
-    max_effort = getattr(args, 'max_effort', False)
 
     # On resume, inherit the thread's saved run config unless explicitly overridden
     # on the CLI (so `dtt --resume ID` picks up where it left off, same settings).
@@ -9519,14 +9514,12 @@ def main():
             cwd = str(Path(_rmeta["cwd"]).expanduser().resolve())
         if max_loops is None and _rmeta.get("max_loops"):
             max_loops = _rmeta["max_loops"]
-        if not _passed("--max-effort") and _rmeta.get("max_effort"):
-            max_effort = True
         saved_overrides = dict(_rmeta.get("model_overrides") or {})
         if _rmeta:
             print(f"    Inherited config: {('quick+fast' if model == OPUS_FAST else 'quick') if quick else ('fast' if model == OPUS_FAST else 'standard')} mode, "
                   f"{'pro' if oracle_model == ORACLE_PRO else 'standard'} oracle, "
                   f"max_loops={max_loops or (QUICK_MAX_LOOPS if quick else MAX_LOOPS)}, "
-                  f"max_effort={max_effort}, cwd={cwd}"
+                  f"cwd={cwd}"
                   + (f", model_overrides={saved_overrides}" if saved_overrides else ""),
                   file=sys.stderr)
 
@@ -9647,7 +9640,6 @@ def main():
             notify_email=getattr(args, 'notify_email', None),
             max_cost=getattr(args, 'max_cost', None),
             tui_mode=getattr(args, 'tui', False),
-            max_effort=max_effort,
             show_full=getattr(args, 'show_full', False),
             quick=quick,
             model_overrides=model_overrides,

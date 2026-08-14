@@ -77,8 +77,80 @@ dtt_update() (
     fi
 )
 
+# ── Self-install ────────────────────────────────────────────────
+# Puts this script at ~/.local/bin/dtt and makes sure that directory is on
+# PATH — it is by default on macOS, but not on most Linux distros. Drives the
+# website one-liner:  curl -fsSL dotheth.ing/dtt.sh | bash -s -- --install
+dtt_install() {
+    src="${DTT_INSTALL_SRC:-https://dotheth.ing/dtt.sh}"
+    bin_dir="$HOME/.local/bin"
+    dest="$bin_dir/dtt"
+    mkdir -p "$bin_dir"
+    dest_real="$(realpath "$dest" 2>/dev/null || echo "$dest")"
+
+    if [ -r "$DTT_SELF" ] && head -1 "$DTT_SELF" | grep -q '^#!/usr/bin/env bash' \
+       && grep -q '^DTT_VERSION=' "$DTT_SELF"; then
+        # Started from a real copy of the script — install that one.
+        if [ "$DTT_SELF" = "$dest_real" ]; then
+            echo "▸ dothething $DTT_VERSION is already installed at $dest" >&2
+        else
+            echo "▸ Installing dothething $DTT_VERSION → $dest" >&2
+            cp -f "$DTT_SELF" "$dest" || {
+                echo "✗ Could not write $dest" >&2
+                exit 1
+            }
+        fi
+    else
+        # Piped from curl: $0 is the shell, not this script, so there is
+        # nothing on disk to copy and bash has already eaten stdin. Fetch the
+        # canonical copy instead.
+        echo "▸ Downloading dothething → $dest" >&2
+        tmp=$(mktemp "$bin_dir/.dtt_install.XXXXXX")
+        if ! curl -fsSL --max-time 120 "$src" -o "$tmp"; then
+            rm -f "$tmp"
+            echo "✗ Download failed: $src" >&2
+            exit 1
+        fi
+        # Sanity-check we got the script, not an error or redirect page.
+        if ! head -1 "$tmp" | grep -q '^#!/usr/bin/env bash'; then
+            rm -f "$tmp"
+            echo "✗ That didn't look like the dtt script. Aborting." >&2
+            exit 1
+        fi
+        mv -f "$tmp" "$dest"
+    fi
+    # Explicit mode, not `chmod +x`: mktemp makes the download 0600, which
+    # would otherwise leave the installed script at 0711.
+    chmod 0755 "$dest"
+
+    case ":${PATH:-}:" in
+        *":$bin_dir:"*)
+            echo "✓ Installed. $bin_dir is already on your PATH — just run: dtt" >&2
+            ;;
+        *)
+            # Pick the startup file for the user's login shell (we may be
+            # running under bash via the pipe, so detect via $SHELL, not
+            # $BASH_VERSION).
+            case "$(basename "${SHELL:-sh}")" in
+                zsh)  rc="$HOME/.zshrc" ;;
+                bash) rc="$HOME/.bashrc" ;;
+                *)    rc="$HOME/.profile" ;;
+            esac
+            line='export PATH="$HOME/.local/bin:$PATH"'
+            if ! { [ -f "$rc" ] && grep -qF "$line" "$rc"; }; then
+                printf '\n# Added by the dothething installer\n%s\n' "$line" >> "$rc"
+                echo "✓ Added ~/.local/bin to your PATH in $rc" >&2
+            fi
+            echo "✓ Installed to $dest" >&2
+            echo "" >&2
+            echo "  Open a new terminal (or run:  source $rc), then run:  dtt" >&2
+            ;;
+    esac
+}
+
 KEEP_TEMP=false
 FORCE_UPDATE=false
+DO_INSTALL=false
 PASS_ARGS=()
 for arg in "$@"; do
   case "$arg" in
@@ -98,6 +170,9 @@ for arg in "$@"; do
     --update)
       FORCE_UPDATE=true
       ;;
+    --install)
+      DO_INSTALL=true
+      ;;
     -h|--help)
       cat <<'HELP'
 dothething — autonomous AI agent | https://dotheth.ing
@@ -107,8 +182,14 @@ Usage:
            [--oraclepro] [--max-effort] [--model [ROLE=]SLUG]
            [--headed] [--orchestrator]
            [--verbose] [--debug] [--keep-temp] [--resume THREAD_ID]
-           [--version] [--update] [--pipe] [--tui] [--notify-desktop]
-           [--notify-email EMAIL] [--max-cost USD]
+           [--version] [--update] [--install] [--pipe] [--tui]
+           [--notify-desktop] [--notify-email EMAIL] [--max-cost USD]
+
+Install:
+  curl -fsSL dotheth.ing/dtt.sh | bash -s -- --install
+                  Puts dtt in ~/.local/bin and adds it to PATH if needed.
+                  Everything else (venv, SearXNG, Notte) installs itself on
+                  first run. Already have the file? ./dtt.sh --install
 
 Quick mode:
   ./dtt.sh q "what's the weather like in Cape Town today"
@@ -157,6 +238,7 @@ Flags:
   --keep-temp     Keep the temp runtime directory on exit
   --version, -V   Print the dothething version and exit
   --update        Force an update check (bypasses the 6h rate limit) and exit
+  --install       Install dtt to ~/.local/bin, adding it to PATH if needed
 
 Environment:
   OPENROUTER_API_KEY     Required. Your OpenRouter API key.
@@ -182,6 +264,11 @@ HELP
       ;;
   esac
 done
+
+if [ "$DO_INSTALL" = true ]; then
+    dtt_install
+    exit 0
+fi
 
 mkdir -p "$BASE" "$DTT_CACHE"
 if [ "$FORCE_UPDATE" = true ]; then

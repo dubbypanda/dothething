@@ -27,10 +27,11 @@ You describe a task in plain English. The agent breaks it down, picks the right 
 ## Quick start
 
 ```bash
-git clone https://github.com/fluffypony/dothething.git
-cd dothething
-./dtt.sh --prompt "Find the 10 largest public companies by revenue that went bankrupt in the last 20 years and write a markdown report with causes and timelines."
+curl -fsSL dotheth.ing/dtt.sh | bash -s -- --install
+dtt --prompt "Find the 10 largest public companies by revenue that went bankrupt in the last 20 years and write a markdown report with causes and timelines."
 ```
+
+`--install` puts the script in `~/.local/bin/dtt` and adds that directory to your PATH if it isn't there already (macOS has it by default, most Linux distros don't). It is the same script either way, so if you'd rather clone the repo, `git clone https://github.com/fluffypony/dothething.git && ./dtt.sh --install` gets you to the same place, and `./dtt.sh` runs fine without installing at all.
 
 First run prompts for your OpenRouter API key (required) and a 2Captcha API key (optional), and saves them to `~/.dtt/env` (mode 0600). Subsequent runs read the keys from there. To skip the prompt, export `OPENROUTER_API_KEY` in your shell first; values in the shell environment take precedence over the saved file. To change or clear the saved keys, edit or delete `~/.dtt/env`.
 
@@ -86,6 +87,8 @@ Everything else is installed automatically into `/tmp/dothething` on first run.
 | `--max-cost USD` | Stop and checkpoint when cumulative cost reaches this amount |
 | `--verbose` | Show full error tracebacks |
 | `--debug` | Log raw API payloads and cache metrics |
+| `--install` | Install the script to `~/.local/bin/dtt`, adding that directory to your PATH if needed |
+| `--update` | Force an update check, bypassing the 6-hour rate limit |
 
 ## How it works
 

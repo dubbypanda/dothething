@@ -635,7 +635,7 @@
         <section class="install-block" vid="73">
             <div class="meta-heading" vid="74">INITIALIZATION // INSTALL SCRIPT</div>
             <div class="code-container" vid="75">
-                <code id="install-cmd" vid="76">curl -fsSL dotheth.ing/install.sh | bash</code>
+                <code id="install-cmd" vid="76">curl -fsSL dotheth.ing/dtt.sh | bash -s -- --install</code>
                 <button class="copy-btn" onclick="copyCommand()" vid="77">Copy</button>
             </div>
             <div class="req-note" vid="78">
@@ -788,6 +788,7 @@
                         <tr><td class="col-key">--tui</td><td class="col-val">Full-screen TUI for single-agent mode.</td></tr>
                         <tr><td class="col-key">--notify-desktop</td><td class="col-val">Desktop notification when the task finishes.</td></tr>
                         <tr><td class="col-key">--notify-email EMAIL</td><td class="col-val">Email a notification when the task finishes.</td></tr>
+                        <tr><td class="col-key">--install</td><td class="col-val">Install to ~/.local/bin/dtt, adding it to PATH if needed.</td></tr>
                         <tr><td class="col-key">--max-cost USD</td><td class="col-val">Stop and checkpoint at this cumulative cost.</td></tr>
                         <tr><td class="col-key">--version / -V</td><td class="col-val">Print version and exit.</td></tr>
                         <tr><td class="col-key">--update</td><td class="col-val">Force an update check (bypasses 6-hour rate limit).</td></tr>

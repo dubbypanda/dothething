@@ -244,6 +244,10 @@ Environment:
   DTT_MODEL_WORKER       Optional. Same for the worker (summaries, delegation, batch).
   DTT_MODEL_ORACLE       Optional. Same for the oracle.
   DTT_MODEL_BROWSER      Optional. Same for the Notte browser agent.
+  DTT_NOTTE_SERP_SESSIONS  Optional. Browser sessions backing the search bridge
+                         (default 4, max 8). General-web engines fetch their
+                         SERPs through these; more sessions means faster
+                         searches at ~500MB each.
   SERPER_API_KEY         Optional. Uses Serper for hybrid general search and batch_process enrichment.
   TWOCAPTCHA_API_KEY     Optional. Enables automated captcha solving.
   AGENTMAIL_API_KEY      Optional. AgentMail key for email tools.
@@ -400,7 +404,8 @@ fi
 if [ ! -f "$DTT_CACHE/.searxng_v5" ]; then
     echo "▸ Installing SearXNG (first run — takes 1-2 min)..."
     # v5 bump: force a fresh clone. v4 and earlier installed once and then
-    # pinned that checkout forever, so engine fixes never arrived.
+    # pinned that checkout forever, so engine fixes never arrived — and the
+    # notte_serp engine leans on upstream's parsers staying current.
     rm -rf "$DTT_CACHE/searxng"
     git clone --depth 1 -q https://github.com/searxng/searxng.git "$DTT_CACHE/searxng"
     [ ! -f "$DTT_CACHE/searxng_venv/bin/activate" ] && python3 -m venv "$DTT_CACHE/searxng_venv"
@@ -615,20 +620,101 @@ IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
 MAX_INLINE_BYTES = 5 * 1024 * 1024
 DEFAULT_HEADLESS_VIEWPORT_WIDTH = 1280
 DEFAULT_HEADLESS_VIEWPORT_HEIGHT = 1080
-SEARXNG_ENABLED_ENGINES = [
-    "google",
-    "bing",
-    "duckduckgo",
-    "brave",
-    "google images",
-    "bing images",
-    "google news",
-    "google scholar",
-    "arxiv",
-    "github",
-    "stackoverflow",
-    "wikipedia",
-    "wikidata",
+# How many browser sessions the SERP bridge runs. SearXNG queries every engine
+# for a search at once, so this is what stops the Notte lane from queueing:
+# roughly ceil(len(SEARXNG_NOTTE_ENGINES) / sessions) rounds of ~5s each. Each
+# session is a Camoufox process (~500MB), so it trades memory for search
+# latency. Override with DTT_NOTTE_SERP_SESSIONS.
+NOTTE_SERP_SESSIONS = 4
+
+# General-web SERPs, fetched through the Notte browser bridge (see
+# NotteSerpBridge). These are the engines that fingerprint and captcha
+# SearXNG's plain httpx client. (name, upstream engine module).
+#
+# Every entry here costs a slot in the browser pool, so moving an engine that
+# doesn't actually wall us — mojeek and yep don't — to SEARXNG_DIRECT_ENGINES
+# makes searches faster with no loss of coverage.
+SEARXNG_NOTTE_ENGINES = [
+    ("google", "google"),
+    ("google news", "google_news"),
+    ("google scholar", "google_scholar"),
+    ("google images", "google_images"),
+    ("bing", "bing"),
+    ("bing news", "bing_news"),
+    ("duckduckgo", "duckduckgo"),
+    ("brave", "brave"),
+    ("startpage", "startpage"),
+    ("qwant", "qwant"),
+    ("mojeek", "mojeek"),
+    ("yep", "yep"),
+    ("mwmbl", "mwmbl"),
+    ("yahoo", "yahoo"),
+]
+
+# Fetched directly by SearXNG. Public APIs and structured records with no bot
+# protection: a browser would add 20s per query and buy nothing. The weights
+# float primary sources above general web hits in the merged ranking, which is
+# the cheap answer to SERPs increasingly full of AI-written listicles.
+# (name, weight or None).
+SEARXNG_DIRECT_ENGINES = [
+    ("openalex", 3.0),
+    ("crossref", 2.5),
+    ("pubmed", 2.5),
+    ("arxiv", 2.0),
+    ("semantic scholar", 2.0),
+    ("openairepublications", 2.0),
+    ("openairedatasets", 2.0),
+    ("wikipedia", None),
+    ("wikidata", None),
+    ("wikibooks", None),
+    ("github", None),
+    ("gitlab", None),
+    ("codeberg", None),
+    ("stackoverflow", None),
+    ("askubuntu", None),
+    ("superuser", None),
+    ("hackernews", 1.4),
+    ("lobste.rs", None),
+    ("crowdview", 1.4),
+    ("boardreader", 1.5),
+    ("pypi", None),
+    ("npm", None),
+    ("crates.io", None),
+    ("docker hub", None),
+    ("huggingface", None),
+    ("mdn", None),
+    ("arch linux wiki", None),
+]
+
+# Ranking priority for merged results (see _build_search_engine_priority).
+SEARXNG_ENABLED_ENGINES = (
+    [name for name, _ in SEARXNG_NOTTE_ENGINES]
+    + [name for name, _ in SEARXNG_DIRECT_ENGINES]
+)
+
+# Host patterns applied by SearXNG's hostnames plugin. low_priority demotes the
+# SEO/AI-listicle supply side that now dominates general SERPs; high_priority
+# floats primary sources. Cheap provenance prior, applied before the agent ever
+# sees a result.
+SEARXNG_HIGH_PRIORITY_HOSTS = [
+    r"(.*\.)?gov$",
+    r"(.*\.)?gov\..*$",
+    r"(.*\.)?edu$",
+    r"(.*\.)?ac\..*$",
+    r"(.*\.)?europa\.eu$",
+    r"(.*\.)?doi\.org$",
+    r"(.*\.)?arxiv\.org$",
+    r"(.*\.)?sec\.gov$",
+    r"(.*\.)?ietf\.org$",
+    r"(.*\.)?lore\.kernel\.org$",
+]
+SEARXNG_LOW_PRIORITY_HOSTS = [
+    r"(.*\.)?pinterest\..*$",
+    r"(.*\.)?quora\.com$",
+    r"(.*\.)?slideshare\.net$",
+    r"(.*\.)?scribd\.com$",
+    r"(.*\.)?(top|best)[a-z0-9-]*reviews?\..*$",
+    r"(.*\.)?[a-z0-9-]*(deals|coupon|discount)[a-z0-9-]*\..*$",
 ]
 
 def _make_headers(api_key):
@@ -884,6 +970,267 @@ class Spinner:
                 sys.stderr.write("\r\033[K")
                 sys.stderr.flush()
 
+# Written into the SearXNG source tree as searx/engines/notte_serp.py. Lives
+# here rather than in the repo so it ships with the single-file script and is
+# rewritten on every run, which keeps it in step with the bridge it talks to.
+NOTTE_SERP_ENGINE_SOURCE = '''# Installed by dothething — not part of upstream SearXNG.
+"""Fetch an upstream engine's SERP through dothething's Notte browser.
+
+SearXNG fetches with plain httpx: no JS, no browser TLS fingerprint, no
+captcha handling. Google, Brave and the rest wall that on sight, so those
+engines quietly return nothing while still looking configured.
+
+This module changes only the transport. The upstream engine still builds the
+search URL and still parses the response; in between, the fetch goes to
+dothething's local Notte bridge, which issues the request from inside a
+Camoufox page and returns the body. Parsing stays upstream's job on purpose —
+those parsers track SERP layouts that change often, and inheriting their fixes
+with a SearXNG update beats maintaining a private copy. Where a layout has
+drifted past what upstream's selectors match, _generic_results below picks up
+the pieces rather than dropping the result set.
+
+Registered once per upstream in the generated settings.yml:
+
+    - name: google
+      engine: notte_serp
+      upstream: google        # module under searx/engines/ to delegate to
+      inactive: false
+      disabled: false
+      timeout: 30.0
+
+Caveat: an upstream whose request() fetches a token by calling searx.network
+itself (duckduckgo's vqd) makes that preflight directly, not through the
+browser. Only the SERP fetch is bridged.
+"""
+
+from json import loads
+
+engine_type = "online"
+categories = ["general"]
+paging = True
+time_range_support = False
+safesearch = False
+# These are read before setup() runs, so they can't be copied off the upstream
+# yet; setup() corrects them once it has the real engine. language_support has
+# to start True because SearXNG rejects an engine that declares False while
+# carrying language traits, which most of the big SERPs do.
+language_support = True
+about = {}
+
+# SearXNG's networks disable plain HTTP by default and mount a transport that
+# rejects it outright. The bridge is on loopback, so this engine needs it back.
+enable_http = True
+
+# Set per instance from settings.yml.
+upstream = ""
+notte_url = ""
+notte_token = ""
+
+# Keys that are ours, not the upstream engine's.
+_OURS = ("engine", "upstream", "notte_url", "notte_token")
+
+_engine = None
+
+
+def setup(engine_data):
+    """Load a fully initialised namespace for the upstream engine.
+
+    Built through searx's own load_engine so the upstream gets its traits,
+    logger and defaults exactly as it would if it were registered directly.
+    """
+    global _engine, categories, paging, time_range_support, safesearch
+    global language_support
+
+    if not upstream or not notte_url:
+        return False
+
+    from searx.engines import load_engine  # noqa: PLC0415
+
+    data = {k: v for k, v in engine_data.items() if k not in _OURS}
+    data["engine"] = upstream
+    # google and google images ship inactive in upstream defaults, which
+    # strips them from settings entirely; disabled: false does not undo it.
+    data["inactive"] = False
+    data["disabled"] = False
+
+    _engine = load_engine(data)
+    if _engine is None:
+        return False
+
+    # Answer for the same queries the upstream would have answered.
+    categories = list(getattr(_engine, "categories", categories) or categories)
+    paging = bool(getattr(_engine, "paging", paging))
+    time_range_support = bool(getattr(_engine, "time_range_support", time_range_support))
+    safesearch = bool(getattr(_engine, "safesearch", safesearch))
+    language_support = bool(getattr(_engine, "language_support", language_support))
+    return True
+
+
+def request(query, params):
+    inner = dict(params)
+    inner["headers"] = dict(params.get("headers") or {})
+    inner["cookies"] = dict(params.get("cookies") or {})
+    _engine.request(query, inner)
+
+    target = inner.get("url")
+    if not target:
+        params["url"] = ""
+        return params
+
+    params["url"] = notte_url
+    params["method"] = "POST"
+    params["data"] = {}
+    params["content"] = b""
+    params["json"] = {
+        "url": target,
+        "engine": upstream,
+        "headers": inner.get("headers") or {},
+        "timeout_ms": int(float(params.get("timeout") or 30) * 1000),
+    }
+    if notte_token:
+        params["headers"]["Authorization"] = "Bearer " + notte_token
+    params["allow_redirects"] = True
+    # Read back in response() — the upstream parser needs the params the
+    # upstream built, not the ones describing our call to the bridge.
+    params["notte_inner"] = inner
+    return params
+
+
+class _BridgedResponse:
+    """Enough of an httpx.Response for an upstream engine's response()."""
+
+    def __init__(self, html, url, search_params):
+        self.text = html
+        self.content = html.encode("utf-8", "replace")
+        self.status_code = 200
+        self.reason_phrase = "OK"
+        self.encoding = "utf-8"
+        self.headers = {"content-type": "text/html; charset=utf-8"}
+        self.history = []
+        self.search_params = search_params
+        self.ok = True
+        try:
+            from httpx import URL  # noqa: PLC0415
+
+            self.url = URL(url)
+        except Exception:
+            self.url = url
+
+    def json(self, **kw):
+        return loads(self.text)
+
+    def raise_for_status(self):
+        return None
+
+
+def _generic_results(html, final_url):
+    """Last-resort extraction for SERPs the upstream parser can't read.
+
+    Upstream parsers target the markup an engine serves a plain HTTP client.
+    Behind a browser some engines answer with a different layout entirely —
+    Google is the live example — and the upstream selector then matches
+    nothing at all. Rather than let a working fetch produce zero results,
+    pull the shape every SERP shares: a heading, the outbound link nearest
+    it, and whatever descriptive text sits in the same block.
+
+    Titles and URLs come out reliably; snippets often don't, because several
+    engines only ship descriptions to script. That trade is deliberate — the
+    agent fetches the page for detail anyway, and a result with no snippet is
+    worth incomparably more than no result.
+    """
+    from lxml import html as _html  # noqa: PLC0415
+    from urllib.parse import parse_qs, unquote, urlsplit  # noqa: PLC0415
+
+    try:
+        dom = _html.fromstring(html)
+    except Exception:
+        return []
+    for junk in dom.xpath("//script|//style|//noscript"):
+        parent = junk.getparent()
+        if parent is not None:
+            parent.remove(junk)
+
+    try:
+        host = urlsplit(final_url).netloc.lower()
+        base = ".".join(host.split(".")[-2:]) if host else ""
+    except Exception:
+        base = ""
+
+    results = []
+    seen = set()
+    for heading in dom.xpath('//h3|//*[@role="heading"]'):
+        node = heading
+        link = ""
+        for _ in range(6):
+            node = node.getparent()
+            if node is None:
+                break
+            for anchor in node.xpath(".//a[@href]"):
+                href = anchor.get("href") or ""
+                if href.startswith("/url?"):
+                    # Google wraps outbound links in a redirect.
+                    target = parse_qs(urlsplit(href).query).get("q")
+                    href = unquote(target[0]) if target else ""
+                if not href.startswith("http"):
+                    continue
+                if base and base in href:
+                    continue    # the engine's own chrome, not a result
+                link = href
+                break
+            if link:
+                break
+
+        title = " ".join(heading.text_content().split())
+        if not link or not title or link in seen:
+            continue
+        seen.add(link)
+
+        snippet = ""
+        scope = node
+        for _ in range(3):
+            if scope is None:
+                break
+            texts = []
+            for chunk in scope.itertext():
+                chunk = " ".join(chunk.split())
+                # Breadcrumb trails repeat the URL and crowd out the real text.
+                if len(chunk) < 40 or chunk == title or "›" in chunk:
+                    continue
+                texts.append(chunk)
+            if texts:
+                snippet = max(texts, key=len)
+                break
+            scope = scope.getparent()
+
+        results.append({"url": link, "title": title, "content": snippet[:300]})
+    return results
+
+
+def response(resp):
+    payload = loads(resp.text)
+    error = payload.get("error")
+    if error:
+        # A plain exception records against this engine in /stats without
+        # tripping the captcha suspension path — solving is the bridge's job,
+        # so benching the engine for a day would be the wrong response.
+        raise RuntimeError("notte[{0}]: {1}".format(upstream, error))
+
+    html = payload.get("html") or ""
+    inner = (getattr(resp, "search_params", None) or {}).get("notte_inner") or {}
+    final_url = payload.get("url") or inner.get("url") or ""
+
+    try:
+        results = _engine.response(_BridgedResponse(html, final_url, inner))
+    except Exception:
+        # Includes the upstream's own captcha detection. The bridge already
+        # had its go at the wall, so fall through and try to read the page.
+        results = None
+
+    if results:
+        return results
+    return _generic_results(html, final_url)
+'''
+
 # ═══════════════════════════════════════════════════════════════════
 # SearXNG — lifecycle management (separate venv)
 # ═══════════════════════════════════════════════════════════════════
@@ -892,6 +1239,7 @@ class SearXNG:
         self.port = None
         self.process = None
         self.settings_path = None
+        self.loaded_engines = set()
         self._log_fh = None
 
     def _find_port(self):
@@ -899,33 +1247,121 @@ class SearXNG:
             s.bind(("127.0.0.1", 0))
             return s.getsockname()[1]
 
-    def start(self, spinner=None):
+    def start(self, spinner=None, serp_bridge=None):
         self.port = self._find_port()
         if spinner:
             spinner.update(f"Starting SearXNG on :{self.port}...")
 
         src = DTT_CACHE / "searxng"
 
+        # Install the bridge engine into the source tree. Rewritten every run
+        # so it can't drift from the NotteSerpBridge it talks to.
+        engines_dir = src / "searx" / "engines"
+        if engines_dir.is_dir():
+            try:
+                (engines_dir / "notte_serp.py").write_text(NOTTE_SERP_ENGINE_SOURCE)
+            except OSError:
+                serp_bridge = None
+        else:
+            serp_bridge = None
+
+        engines = []
+        if serp_bridge and serp_bridge.url:
+            # These entries merge by name onto the upstream defaults, so each
+            # engine keeps its shortcut and category and only swaps transport.
+            for name, module in SEARXNG_NOTTE_ENGINES:
+                engines.append({
+                    "name": name,
+                    "engine": "notte_serp",
+                    "upstream": module,
+                    "notte_url": serp_bridge.url,
+                    "notte_token": serp_bridge.token,
+                    "inactive": False,
+                    "disabled": False,
+                    # The browser is the slow part; SearXNG clamps this to
+                    # outgoing.max_request_timeout, set well above it below.
+                    "timeout": 30.0,
+                })
+        else:
+            # No bridge: fall back to SearXNG's own httpx fetches. Google and
+            # friends will mostly wall these, but the direct lane still works.
+            for name, _module in SEARXNG_NOTTE_ENGINES:
+                engines.append({"name": name, "inactive": False, "disabled": False})
+
+        for name, weight in SEARXNG_DIRECT_ENGINES:
+            entry = {"name": name, "inactive": False, "disabled": False}
+            if weight is not None:
+                entry["weight"] = weight
+            engines.append(entry)
+
         cfg = {
-            "use_default_settings": {
-                "engines": {
-                    "keep_only": SEARXNG_ENABLED_ENGINES,
-                },
+            # No keep_only: it pruned every engine not named here, which threw
+            # away all ~330 others including every primary-source database, and
+            # left !bang syntax pointing at engines that no longer existed.
+            "use_default_settings": True,
+            "general": {
+                "debug": False,
+                "enable_metrics": True,   # /stats shows which engines are walled
             },
             "server": {
                 "secret_key": os.urandom(32).hex(),
                 "bind_address": "127.0.0.1",
                 "port": self.port,
                 "limiter": False,
+                "public_instance": False,
+                "image_proxy": False,
             },
             "search": {
                 "formats": ["html", "json"],
-                "default_lang": "en",
+                # "en" silently drops non-English primary sources, which is
+                # most of what a general index doesn't already cover.
+                "default_lang": "all",
+                "safe_search": 0,
+                "max_page": 0,        # buried results live on pages 3-10
+                "autocomplete": "",
+                # Defaults bench an engine for a day (15 days for a Cloudflare
+                # captcha) on the theory that retrying from a flagged IP makes
+                # it worse. Our retry comes from a fresh browser session, so
+                # those are far too long — but not zero, since a wall we failed
+                # to clear is still worth backing off from.
+                "suspended_times": {
+                    "SearxEngineAccessDenied": 300,
+                    "SearxEngineCaptcha": 3600,
+                    "SearxEngineTooManyRequests": 600,
+                    "cf_SearxEngineCaptcha": 3600,
+                    "cf_SearxEngineAccessDenied": 3600,
+                    "recaptcha_SearxEngineCaptcha": 3600,
+                },
             },
-            "engines": [
-                {"name": name, "disabled": False}
-                for name in SEARXNG_ENABLED_ENGINES
-            ],
+            "outgoing": {
+                "request_timeout": 6.0,
+                # Ceiling for per-engine timeout; the Notte lane asks for 30s.
+                "max_request_timeout": 45.0,
+                "pool_connections": 200,
+                "pool_maxsize": 50,
+                "enable_http2": True,
+            },
+            # Replaces the default set wholesale, so this lists everything we
+            # want on, not just the changes.
+            "plugins": {
+                "searx.plugins.calculator.SXNGPlugin": {"active": False},
+                "searx.plugins.hash_plugin.SXNGPlugin": {"active": False},
+                "searx.plugins.self_info.SXNGPlugin": {"active": False},
+                "searx.plugins.unit_converter.SXNGPlugin": {"active": False},
+                "searx.plugins.time_zone.SXNGPlugin": {"active": False},
+                "searx.plugins.infinite_scroll.SXNGPlugin": {"active": False},
+                "searx.plugins.tor_check.SXNGPlugin": {"active": False},
+                "searx.plugins.ahmia_filter.SXNGPlugin": {"active": False},
+                "searx.plugins.tracker_url_remover.SXNGPlugin": {"active": True},
+                "searx.plugins.hostnames.SXNGPlugin": {"active": True},
+                # Rewrites paywalled DOIs to an open-access copy.
+                "searx.plugins.oa_doi_rewrite.SXNGPlugin": {"active": True},
+            },
+            "hostnames": {
+                "high_priority": SEARXNG_HIGH_PRIORITY_HOSTS,
+                "low_priority": SEARXNG_LOW_PRIORITY_HOSTS,
+            },
+            "engines": engines,
         }
 
         # IMPORTANT: write our override to a file OUTSIDE the searxng source tree.
@@ -952,28 +1388,38 @@ class SearXNG:
         )
         atexit.register(self.stop)
 
-        # Health check via actual search query (from GPT1)
+        # Health check against /config rather than a real search: a search now
+        # fans out to the browser lane and would take ~30s. /config is also the
+        # only way to see which engines actually loaded — an unknown name in
+        # our override list is merged in as a new entry rather than rejected,
+        # so a typo here shows up as an engine that silently never runs.
         import httpx as hx
         client = hx.Client(timeout=10)
-        for _ in range(90):
-            time.sleep(1)
-            if self.process.poll() is not None:
-                client.close()
-                self.port = None
-                return False
-            try:
-                resp = client.get(
-                    f"http://127.0.0.1:{self.port}/search",
-                    params={"q": "ping", "format": "json"},
-                )
-                if resp.status_code == 200:
-                    client.close()
-                    return True
-            except Exception:
-                pass
-        client.close()
+        try:
+            for _ in range(90):
+                time.sleep(1)
+                if self.process.poll() is not None:
+                    self.port = None
+                    return False
+                try:
+                    resp = client.get(f"http://127.0.0.1:{self.port}/config")
+                    if resp.status_code == 200:
+                        self.loaded_engines = {
+                            e.get("name") for e in resp.json().get("engines", [])
+                        }
+                        return True
+                except Exception:
+                    pass
+        finally:
+            client.close()
         self.port = None
         return False
+
+    def missing_engines(self):
+        """Configured engines that SearXNG didn't load, for the startup line."""
+        if not self.loaded_engines:
+            return []
+        return [n for n in SEARXNG_ENABLED_ENGINES if n not in self.loaded_engines]
 
     def stop(self):
         if self.process and self.process.poll() is None:
@@ -1375,6 +1821,71 @@ class Browser:
           finally:
             await self._save_cookies(session)
 
+    async def fetch_serp(self, url, timeout_ms=30000):
+        """Fetch `url` from inside a real browser page and return the body.
+
+        Deliberately not a navigation. Google serves a browser a JS-driven
+        page whose result links are empty until script runs, so scraping the
+        rendered DOM loses every href; it serves a plain HTTP client a
+        "please enable JavaScript" stub with no results at all. Issuing the
+        request with fetch() from a page already on that origin gets the
+        third thing — the real response body, with the browser's TLS
+        fingerprint, cookies and IP behind it — which is what a SERP parser
+        wants.
+
+        The navigation still happens first, to the origin rather than the
+        query, so consent walls and interstitials get cleared (and solved)
+        once and the cookies are in place for the fetch that follows.
+        """
+        origin = ""
+        try:
+            parts = urlsplit(url)
+            origin = f"{parts.scheme}://{parts.netloc}"
+        except Exception:
+            pass
+
+        async with self._fetch_lock:
+            try:
+                session = await self._ensure()
+            except Exception as e:
+                async with self._lock:
+                    self._session = None
+                raise RuntimeError(f"browser launch failed: {e}") from e
+            try:
+                await self._load_cookies(session)
+                page = session.window.page
+                if origin and not (page.url or "").startswith(origin):
+                    result = await session.aexecute(type="goto", url=origin)
+                    if not result.success:
+                        raise RuntimeError(f"navigation failed: {result.message}")
+                    page = session.window.page
+                    await self._settle_page(session, page, min(timeout_ms, 20000))
+
+                payload = await page.evaluate(
+                    """async (target) => {
+                        try {
+                            const r = await fetch(target, {
+                                credentials: "include",
+                                redirect: "follow",
+                            });
+                            return {ok: true, status: r.status, url: r.url,
+                                    text: await r.text()};
+                        } catch (e) {
+                            return {ok: false, error: String(e)};
+                        }
+                    }""",
+                    url,
+                )
+                if not payload.get("ok"):
+                    raise RuntimeError(payload.get("error") or "fetch failed")
+                return {
+                    "html": payload.get("text") or "",
+                    "url": payload.get("url") or url,
+                    "status": int(payload.get("status") or 200),
+                }
+            finally:
+                await self._save_cookies(session)
+
     async def close(self):
         async with self._lock:
             if self._session:
@@ -1383,6 +1894,208 @@ class Browser:
                 except Exception:
                     pass
                 self._session = None
+
+# ═══════════════════════════════════════════════════════════════════
+# Notte SERP bridge — lets SearXNG fetch through a real browser
+# ═══════════════════════════════════════════════════════════════════
+class NotteSerpBridge:
+    """Localhost endpoint that fetches a SERP in Camoufox for SearXNG.
+
+    SearXNG makes its own outbound requests with plain httpx: no JS, no
+    browser TLS fingerprint, no captcha handling. Google, Brave and the rest
+    wall that on sight, so those engines quietly contribute nothing while
+    still appearing configured. The notte_serp engine module (written into
+    the SearXNG tree by SearXNG.start) posts the upstream SERP URL here
+    instead of fetching it itself; we load it in a real browser, wait out
+    whatever interstitial appears, and hand back the rendered HTML for
+    SearXNG's own parser to read.
+
+    Parsing deliberately stays on the SearXNG side. Its per-engine parsers
+    are maintained against layouts that change often, and inheriting those
+    fixes with a SearXNG update beats reimplementing them here.
+
+    SearXNG queries every engine for a search at once, so the bridge runs a
+    small pool of browser sessions; one session would make the engines queue
+    behind each other and blow the per-engine timeout. Each session keeps
+    its own page so captcha solving targets the page it is looking at.
+    """
+
+    def __init__(self, sessions=None, headless=True):
+        try:
+            count = int(sessions if sessions is not None
+                        else os.environ.get("DTT_NOTTE_SERP_SESSIONS", NOTTE_SERP_SESSIONS))
+        except (TypeError, ValueError):
+            count = NOTTE_SERP_SESSIONS
+        self.session_count = max(1, min(count, 8))
+        self.headless = headless
+        self.token = os.urandom(24).hex()
+        self.port = None
+        self._server = None
+        self._pool = None
+        self._browsers = []
+        self._loop = None
+        self._thread = None
+
+    @property
+    def url(self):
+        return f"http://127.0.0.1:{self.port}/serp" if self.port else None
+
+    def start(self, timeout=30):
+        """Start the endpoint on a private event loop in its own thread.
+
+        Synchronous on purpose. Orchestrator mode starts one shared SearXNG
+        from non-async Textual setup code, and SearXNG needs the bridge's port
+        before it boots — so this has to be callable from either place. Owning
+        the loop also keeps SERP fetches, which sit on a browser for seconds at
+        a time, off the agent's event loop.
+        """
+        ready = threading.Event()
+        failure = []
+
+        def run():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            self._loop = loop
+
+            async def boot():
+                self._pool = asyncio.Queue()
+                for _ in range(self.session_count):
+                    browser = Browser(headless=self.headless)
+                    self._browsers.append(browser)
+                    self._pool.put_nowait(browser)
+                self._server = await asyncio.start_server(self._handle, "127.0.0.1", 0)
+                self.port = self._server.sockets[0].getsockname()[1]
+
+            try:
+                loop.run_until_complete(boot())
+            except Exception as e:  # noqa: BLE001
+                failure.append(e)
+            finally:
+                ready.set()
+            if not failure:
+                loop.run_forever()
+            loop.close()
+
+        self._thread = threading.Thread(target=run, name="notte-serp-bridge", daemon=True)
+        self._thread.start()
+        if not ready.wait(timeout):
+            raise RuntimeError(f"SERP bridge did not start within {timeout}s")
+        if failure:
+            raise failure[0]
+        return True
+
+    def stop(self, timeout=20):
+        loop = self._loop
+        if loop is None:
+            return
+
+        async def shutdown():
+            if self._server:
+                self._server.close()
+                try:
+                    await self._server.wait_closed()
+                except Exception:
+                    pass
+            for browser in self._browsers:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+
+        try:
+            asyncio.run_coroutine_threadsafe(shutdown(), loop).result(timeout=timeout)
+        except Exception:
+            pass
+        try:
+            loop.call_soon_threadsafe(loop.stop)
+        except Exception:
+            pass
+        if self._thread:
+            self._thread.join(timeout=5)
+        self._loop = None
+        self._server = None
+        self._browsers = []
+        self.port = None
+
+    async def _fetch(self, payload):
+        url = str(payload.get("url") or "").strip()
+        if not url:
+            return {"error": "no url"}
+        try:
+            timeout_ms = int(float(payload.get("timeout_ms") or 30000))
+        except (TypeError, ValueError):
+            timeout_ms = 30000
+        browser = await self._pool.get()
+        try:
+            result = await browser.fetch_serp(
+                url, timeout_ms=max(5000, min(timeout_ms, 60000))
+            )
+            return {
+                "html": result.get("html") or "",
+                "url": result.get("url") or url,
+                "status": result.get("status") or 200,
+            }
+        except Exception as e:
+            return {"error": f"{type(e).__name__}: {e}"[:400]}
+        finally:
+            self._pool.put_nowait(browser)
+
+    async def _handle(self, reader, writer):
+        # Minimal HTTP/1.1 for one JSON endpoint on loopback — not worth a
+        # web framework in the agent's venv.
+        try:
+            try:
+                request_line = await asyncio.wait_for(reader.readline(), timeout=15)
+            except (asyncio.TimeoutError, asyncio.IncompleteReadError):
+                return
+            if not request_line:
+                return
+            headers = {}
+            while True:
+                line = await asyncio.wait_for(reader.readline(), timeout=15)
+                if not line or line in (b"\r\n", b"\n"):
+                    break
+                name, _, value = line.decode("latin-1").partition(":")
+                headers[name.strip().lower()] = value.strip()
+
+            length = int(headers.get("content-length") or 0)
+            raw = await reader.readexactly(length) if length > 0 else b""
+
+            if headers.get("authorization", "") != f"Bearer {self.token}":
+                await self._reply(writer, 403, {"error": "forbidden"})
+                return
+            try:
+                payload = json.loads(raw.decode("utf-8") or "{}")
+            except Exception:
+                await self._reply(writer, 400, {"error": "bad json"})
+                return
+
+            body = await self._fetch(payload)
+            # Always 200: an engine-level failure is data for SearXNG's error
+            # accounting, and a 4xx/5xx here would be recorded as the bridge
+            # being down rather than the upstream being unhappy.
+            await self._reply(writer, 200, body)
+        except Exception:
+            try:
+                await self._reply(writer, 500, {"error": "bridge failure"})
+            except Exception:
+                pass
+        finally:
+            try:
+                writer.close()
+            except Exception:
+                pass
+
+    @staticmethod
+    async def _reply(writer, status, body):
+        payload = json.dumps(body).encode("utf-8")
+        writer.write(
+            b"HTTP/1.1 %d %s\r\nContent-Type: application/json\r\n"
+            b"Content-Length: %d\r\nConnection: close\r\n\r\n"
+            % (status, b"OK" if status == 200 else b"ERROR", len(payload))
+        )
+        writer.write(payload)
+        await writer.drain()
 
 # ═══════════════════════════════════════════════════════════════════
 # Cost Tracker — background queue that fetches OpenRouter stats
@@ -2885,8 +3598,16 @@ TOOLS = [
                     "engines": {
                         "type": "string",
                         "description": (
-                            "Comma-separated SearXNG engine names (e.g. 'google,bing', "
-                            "'google images', 'google scholar'). Default: all enabled engines."
+                            "Comma-separated SearXNG engine names. Default: all enabled "
+                            "engines. General web: google, bing, duckduckgo, brave, "
+                            "startpage, qwant, mojeek, yep, mwmbl, yahoo (these fetch "
+                            "through a browser, so they are slower — narrow to one or "
+                            "two when you only need general results). Primary sources, "
+                            "much faster and better for research: openalex, crossref, "
+                            "pubmed, arxiv, semantic scholar, wikidata, wikipedia. "
+                            "Code and packages: github, gitlab, codeberg, stackoverflow, "
+                            "pypi, npm, crates.io. Discussion: hackernews, lobste.rs, "
+                            "crowdview, boardreader."
                         ),
                     },
                     "result_mode": RESULT_MODE_PROP,
@@ -4634,6 +5355,7 @@ class Agent:
         self.headers = _make_headers(api_key)
         self.messages = []
         self.searxng = SearXNG()
+        self.serp_bridge = NotteSerpBridge(headless=not headed)
         self.browser = Browser(headless=not headed)
         self._browser_cookie_file = None
         self._browser_agent_session = None
@@ -4714,11 +5436,30 @@ class Agent:
         if getattr(self, '_skip_searxng_start', False):
             print(f"  ✓ SearXNG (shared) on port {self.searxng.port}", file=sys.stderr)
         else:
+            # Bridge first: SearXNG reads its URL out of the settings file we
+            # write at boot, so the port has to exist before SearXNG starts.
+            self.spinner.start("Starting search browser bridge...")
+            try:
+                self.serp_bridge.start()
+            except Exception as e:
+                self.serp_bridge = None
+                self.spinner.stop()
+                print(f"  ⚠ Notte SERP bridge unavailable ({e}) — "
+                      "general-web engines fall back to direct fetches",
+                      file=sys.stderr)
+            else:
+                self.spinner.stop()
+                print(f"  ✓ Notte SERP bridge on port {self.serp_bridge.port} "
+                      f"({self.serp_bridge.session_count} sessions)", file=sys.stderr)
+
             self.spinner.start("Starting SearXNG...")
-            ok = self.searxng.start(self.spinner)
+            ok = self.searxng.start(self.spinner, serp_bridge=self.serp_bridge)
             self.spinner.stop()
             if ok:
-                print(f"  ✓ SearXNG on port {self.searxng.port}", file=sys.stderr)
+                missing = self.searxng.missing_engines()
+                note = f" — {len(missing)} engine(s) not loaded: {', '.join(missing[:5])}" if missing else ""
+                print(f"  ✓ SearXNG on port {self.searxng.port}"
+                      f" ({len(self.searxng.loaded_engines)} engines){note}", file=sys.stderr)
             else:
                 if os.environ.get("SERPER_API_KEY"):
                     print(
@@ -5210,7 +5951,10 @@ class Agent:
         resp = await self.http.get(
             f"{self.searxng.url}/search",
             params=params,
-            timeout=20,
+            # Must outlast the slowest engine: the browser lane runs at a 30s
+            # per-engine timeout, and SearXNG returns once every engine has
+            # either answered or timed out.
+            timeout=60,
         )
         if resp.status_code != 200:
             return []
@@ -8338,6 +9082,8 @@ class Agent:
             except Exception:
                 pass
         self.searxng.stop()
+        if self.serp_bridge:
+            self.serp_bridge.stop()
         await self._close_browser_agent_session()
         self._browser_agent_executor.shutdown(wait=False, cancel_futures=True)
         await self.browser.close()
@@ -8807,6 +9553,7 @@ class OrchestratorApp:
         self.next_id = 1
         self.selected_id = None
         self._searxng_url = None
+        self._serp_bridge = None
         self._max_workers = 16
         self._launch_lock = asyncio.Lock()
         self._notify_desktop = notify_desktop
@@ -8932,12 +9679,23 @@ class OrchestratorApp:
                 chat = self._query_chat()
                 chat._mode = "new"
                 self._update_chat_height()
-                # Start shared SearXNG instance for all child agents
+                # Start shared SearXNG instance for all child agents, with its
+                # own SERP bridge — without one the general-web engines fall
+                # back to direct fetches and quietly return nothing.
+                bridge = NotteSerpBridge()
+                try:
+                    bridge.start()
+                except Exception:
+                    bridge = None
                 searxng = SearXNG()
-                if searxng.start():
+                if searxng.start(serp_bridge=bridge):
                     orchestrator._searxng_url = searxng.url
                     orchestrator._searxng = searxng
-                    self.notify(f"SearXNG started on port {searxng.port}")
+                    orchestrator._serp_bridge = bridge
+                    self.notify(f"SearXNG started on port {searxng.port}"
+                                + (f", SERP bridge on {bridge.port}" if bridge else ""))
+                elif bridge:
+                    bridge.stop()
 
             def on_resize(self, event):
                 self._update_chat_height()
@@ -9432,9 +10190,11 @@ class OrchestratorApp:
         tui = OrchestratorTUI()
         tui.title = "dothething orchestrator"
         tui.run()
-        # Clean up shared SearXNG instance
+        # Clean up shared SearXNG instance and its SERP bridge
         if hasattr(self, '_searxng') and self._searxng:
             self._searxng.stop()
+        if getattr(self, '_serp_bridge', None):
+            self._serp_bridge.stop()
 
     def _send_control(self, sid, action, text=None):
         session = self.sessions.get(sid)

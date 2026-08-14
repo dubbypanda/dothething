@@ -11,7 +11,7 @@ It handles research, data extraction, browser automation, file editing, and code
 You describe a task in plain English. The agent breaks it down, picks the right tools, and delivers the output.
 
 - Plans its work and tracks progress
-- Searches the web using a local SearXNG instance (supports Google, Bing, DuckDuckGo, and more -- you can target specific engines or search images directly)
+- Searches the web using a local SearXNG instance. The general-web engines fetch through a real browser, so Google and friends actually answer instead of serving a bot wall; primary-source APIs (OpenAlex, Crossref, PubMed, arXiv) are queried directly and weighted above general web hits
 - Browses pages with Notte and Camoufox (a Firefox fork built to avoid fingerprinting). Extracts page content, solves captchas, and handles multi-step web interactions
 - Reads and edits files, runs shell commands, makes HTTP requests
 - Connects to your existing MCP servers via `~/.dtt/mcp.json`
@@ -99,6 +99,17 @@ The agent routes Claude Fable through OpenRouter. Every turn, the model decides 
 
 **Browser automation.** We use Notte with Camoufox under the hood. For simple scraping, `fetch_page` grabs clean markdown with no LLM cost. If a captcha shows up, it gets solved automatically. For complex multi-step interactions (login flows, forms, SPAs), the agent can hand off the session to a dedicated Notte browser agent via `browser_agent`.
 
+**Search runs through the browser.** SearXNG fetches with a plain HTTP client: no JS, no browser TLS fingerprint, no captcha handling. Google now answers that client with a "please enable JavaScript" stub containing no results at all, so a stock SearXNG install quietly returns nothing for its most important engine while still listing it as configured.
+
+So the general-web engines don't fetch their own pages any more. A bridge engine hands the search URL to a pool of Camoufox sessions, which issue the request from inside a real page and hand back the response body. URL building and parsing stay with SearXNG's own engine modules, so upstream's parser fixes arrive with the weekly SearXNG update instead of being reimplemented here; where a SERP's markup has drifted far enough that upstream's selectors match nothing, a generic extractor pulls titles and links rather than dropping the result set.
+
+Two lanes, set by `SEARXNG_NOTTE_ENGINES` and `SEARXNG_DIRECT_ENGINES` near the top of `dtt.sh`:
+
+- **Browser lane.** Google, Bing, DDG, Brave, Startpage, Qwant, Mojeek, Yep and friends. Correct but slow; a search costs roughly `ceil(engines / sessions)` browser round-trips. `DTT_NOTTE_SERP_SESSIONS` (default 4) sets the pool size, trading about 500MB per session against search latency. Moving an engine that doesn't actually block you to the direct lane is the cheapest speedup available.
+- **Direct lane.** OpenAlex, Crossref, PubMed, arXiv, OpenAIRE, Wikidata, the package registries, the forum and Q&A engines. Public APIs and structured records with no bot protection, weighted 2.0–3.0 so primary sources outrank general web hits. A browser here would add twenty seconds and buy nothing.
+
+The config also drops the old `keep_only` list, which had pruned all ~330 other engines and left `!bang` syntax pointing at engines that no longer existed, and sets `default_lang: all` because `en` was silently discarding non-English primary sources. `oa_doi_rewrite` sends paywalled DOIs to an open-access copy, and the `hostnames` plugin demotes the SEO/AI-listicle hosts that now crowd general SERPs.
+
 **Prompt caching.** We use OpenRouter sticky routing and Anthropic's block-level cache controls. On long tasks, subsequent turns hit the cache, cutting input costs significantly.
 
 **Thread persistence.** Every session saves to `~/.dtt/threads/` with a timestamped ID. If you interrupt a run or hit the loop limit, resume with `--resume <thread-id>`.
@@ -165,7 +176,7 @@ dtt --model main=openai/gpt-5.6-sol --model oracle=anthropic/claude-fable-5 "...
 
 **System:** `run_command`, `shell_session`, `run_code`, `glob`, `list_dir`, `search_file`, `clipboard_copy`, `clipboard_paste`, `request_user_input`
 
-**Web:** `search_web` (hybrid Serper + SearXNG for general discovery, plus engine/category targeting), `fetch_page` (Notte-powered scraping), `browser_agent` (full interactive control), `http_request`
+**Web:** `search_web` (hybrid Serper + SearXNG for general discovery, plus engine/category targeting; general-web engines fetch through Notte), `fetch_page` (Notte-powered scraping), `browser_agent` (full interactive control), `http_request`
 
 **Analysis:** `think`, `oracle`, `delegate`, `analyze_data`, `analyze_image`, `batch_process`
 
@@ -227,6 +238,7 @@ The agent discovers and uses all tools exposed by connected MCP servers.
 | `AGENTMAIL_API_KEY` | No | AgentMail key for email tools |
 | `AGENTMAIL_INBOX_ID` | No | Default AgentMail inbox ID |
 | `AGENTMAIL_HUMAN_EMAIL` | No | Human email for AgentMail OTP verification |
+| `DTT_NOTTE_SERP_SESSIONS` | No | Browser sessions backing the search bridge (default 4, max 8). More sessions means faster searches and about 500MB of memory each |
 
 All variables can be saved to `~/.dtt/env` (shell-exported values take precedence). The agent can update this file via `manage_config`.
 

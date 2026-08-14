@@ -20,7 +20,7 @@ You describe a task in plain English. The agent breaks it down, picks the right 
 - Sends and receives email through its own inbox via AgentMail
 - Copies to and pastes from your system clipboard, including images
 - Accepts mid-task input. Press any key while it's working to type instructions. Ctrl-Q queues input for after the current step finishes
-- Farms out grunt work to a cheaper model. Asks GPT-5.5 for a second opinion when stuck
+- Farms out grunt work to a cheaper model. Asks GPT-5.6 Sol for a second opinion when stuck
 - Saves full conversation threads so you can resume interrupted work
 - Tracks token usage and dollar cost via OpenRouter, with Anthropic prompt caching for cost reduction
 
@@ -74,7 +74,7 @@ Everything else is installed automatically into `/tmp/dothething` on first run.
 | `--fast` | Use claude-opus-4.8-fast:online (cheaper, slightly less capable) |
 | `--cwd DIR` | Set the working directory for file operations (default: `.`) |
 | `--max-loops N` | Cap the number of agent turns (default: 200; 15 in quick mode) |
-| `--oraclepro` | Use GPT-5.5-pro instead of GPT-5.5 for oracle calls |
+| `--oraclepro` | Use GPT-5.6 Sol Pro instead of GPT-5.6 Sol for oracle calls |
 | `--model [ROLE=]SLUG` | Override the model for a role: `main`, `worker`, `oracle`, or `browser`. Repeatable. A bare slug targets `main`; `ROLE=default` clears a saved or env override |
 | `--max-effort` | Pin the GPT-5.5 oracle to `high` reasoning effort, its native ceiling (Fable always runs at `xhigh`, the highest OpenRouter accepts) |
 | `--resume ID` | Pick up a previous session by thread ID. Inherits that thread's saved config (model, oracle, `--max-loops`, `--max-effort`, `--cwd`); pass a flag to override it |
@@ -141,7 +141,7 @@ All calls route through OpenRouter. You only need one API key.
 | Main agent (`main`) | Claude Fable 5 | `--fast` for Opus 4.8-fast; quick mode (`q`) uses Opus 4.8, or Opus 4.8-fast with `--fast` |
 | Summarizer, analysis, delegate (`worker`) | Google Gemini 3.5 Flash | `--model worker=...` |
 | Browser agent, Notte (`browser`) | Claude Sonnet 4.6 | `--model browser=...` |
-| Oracle (`oracle`) | GPT-5.5 | `--oraclepro` for GPT-5.5-pro (not exposed in quick mode) |
+| Oracle (`oracle`) | GPT-5.6 Sol | `--oraclepro` for GPT-5.6 Sol Pro (not exposed in quick mode) |
 
 ### Model overrides
 
@@ -151,7 +151,7 @@ Any of the four roles can be swapped for a different OpenRouter model with `--mo
 dtt --model oracle=x-ai/grok-5 --prompt "..."                # different oracle
 dtt --model worker=google/gemini-3.5-flash-lite "..."        # cheaper worker
 dtt --model anthropic/claude-sonnet-4.6 "..."                # bare slug targets main
-dtt --model main=openai/gpt-5.5 --model oracle=anthropic/claude-fable-5 "..."
+dtt --model main=openai/gpt-5.6-sol --model oracle=anthropic/claude-fable-5 "..."
 ```
 
 `--model` beats the `q`/`--fast`/`--oraclepro` defaults. A resumed thread keeps its overrides unless you pass new ones, and `--model oracle=default` clears one. To make an override permanent, set `DTT_MODEL_MAIN`, `DTT_MODEL_WORKER`, `DTT_MODEL_ORACLE`, or `DTT_MODEL_BROWSER` in `~/.dtt/env`; CLI flags win over env vars. Orchestrator workers inherit whatever overrides are in effect.

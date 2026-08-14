@@ -205,7 +205,7 @@ Flags:
   --prompt "..."  Provide task inline (otherwise opens multiline editor)
   --cwd DIR       Working directory for relative paths (default: .)
   --max-loops N   Maximum agent loop iterations (default: 200)
-  --oraclepro     Use openai/gpt-5.5-pro for oracle (default: openai/gpt-5.5)
+  --oraclepro     Use openai/gpt-5.6-sol-pro for oracle (default: openai/gpt-5.6-sol)
   --max-effort    Pin the GPT-5.5 oracle to 'high' reasoning effort, its native
                   ceiling (Fable always runs at 'xhigh', OpenRouter's maximum)
   --model [ROLE=]SLUG
@@ -531,12 +531,12 @@ OPUS_FAST       = "anthropic/claude-opus-4.8-fast"
 # own model (see browser_agent) — this constant does not drive it.
 WORKER_DEFAULT  = "google/gemini-3.5-flash"
 WORKER          = os.environ.get("DTT_MODEL_WORKER") or WORKER_DEFAULT
-ORACLE_DEFAULT  = "openai/gpt-5.5:online"
-ORACLE_PRO      = "openai/gpt-5.5-pro:online"
+ORACLE_DEFAULT  = "openai/gpt-5.6-sol:online"
+ORACLE_PRO      = "openai/gpt-5.6-sol-pro:online"
 # Roles accepted by --model ROLE=SLUG and the DTT_MODEL_<ROLE> env vars:
 #   main    — the agent itself (default: Fable; Opus in quick mode; -fast with --fast)
 #   worker  — summarization, delegation, analysis, batch, compaction (default: Gemini 3.5 Flash)
-#   oracle  — second opinions (default: GPT-5.5; GPT-5.5-pro with --oraclepro)
+#   oracle  — second opinions (default: GPT-5.6 Sol; Sol Pro with --oraclepro)
 #   browser — the Notte browser agent (default: Sonnet 4.6)
 MODEL_ROLES     = ("main", "worker", "oracle", "browser")
 MAX_LOOPS       = 200
@@ -3185,7 +3185,7 @@ TOOLS = [
         "function": {
             "name": "oracle",
             "description": (
-                "Consult GPT-5.5 (or GPT-5.5-pro with --oraclepro) for a second opinion or validation. "
+                "Consult GPT-5.6 Sol (or Sol Pro with --oraclepro) for a second opinion or validation. "
                 "Inexpensive — use freely for: validating plans against the original request, confirming "
                 "analyses, resolving ambiguity, pre-finalize completeness checks. Set include_context=true "
                 "to send the full conversation history — especially recommended before finalize on complex "
@@ -3916,7 +3916,7 @@ every call in a stage fails, the later stages are skipped automatically.
 and whenever you need to reason about next steps.
 8. Use notes_add to record key findings, URLs, decisions, and intermediate \
 results during long tasks so you don't lose them to context pressure.
-9. oracle calls a second frontier model (GPT-5.5). It is inexpensive — use \
+9. oracle calls a second frontier model (GPT-5.6 Sol). It is inexpensive — use \
 it freely. Good uses: validate your plan against the original instructions, \
 get a second opinion on analysis or interpretation, confirm an ambiguous \
 research finding, sanity-check your final output before finalizing. Set \
@@ -4092,7 +4092,7 @@ work: summarizing documents, extracting structured data, reformatting content, \
 classification. The delegate has NO tools — it only processes text you provide.
 - think: FREE. Use liberally before complex edits, after confusing results, \
 to plan multi-step changes, debug what went wrong.
-- oracle: Inexpensive second opinion from GPT-5.5. Use freely for: validating \
+- oracle: Inexpensive second opinion from GPT-5.6 Sol. Use freely for: validating \
 plans against original instructions, confirming analyses, resolving ambiguity, \
 sanity-checking deliverables. Set include_context=true for a full-context \
 review before finalize to verify nothing was missed. Use think for quick \
@@ -5302,7 +5302,7 @@ class Agent:
                     msgs.append(m)
         msgs.append({"role": "user", "content": question})
         try:
-            # gpt-5.5-pro can reason for ~45 min on hard problems; streaming keeps
+            # Sol Pro can reason for ~45 min on hard problems; streaming keeps
             # the connection alive so it isn't dropped mid-reasoning. 75 min for
             # pro, 15 min for the standard oracle.
             oracle_timeout = 4500 if self.oracle_model == ORACLE_PRO else 900
@@ -9440,7 +9440,7 @@ def main():
                              "no oracle, minimal turns. Combine with --fast for Opus 4.8-fast. "
                              "Shortcut: a leading positional 'q' "
                              "(e.g. dtt q \"what's the weather in Cape Town\")")
-    parser.add_argument("--oraclepro", action="store_true", help="Use gpt-5.5-pro for oracle (default: gpt-5.5)")
+    parser.add_argument("--oraclepro", action="store_true", help="Use gpt-5.6-sol-pro for oracle (default: gpt-5.6-sol)")
     parser.add_argument("--model", action="append", default=[], metavar="[ROLE=]SLUG",
                         help="Override the model for a role: main, worker, oracle, or browser "
                              "(e.g. --model oracle=x-ai/grok-5 --model worker=google/gemini-3.5-flash-lite). "

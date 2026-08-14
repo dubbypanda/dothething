@@ -105,8 +105,10 @@ So the general-web engines don't fetch their own pages any more. A bridge engine
 
 Two lanes, set by `SEARXNG_NOTTE_ENGINES` and `SEARXNG_DIRECT_ENGINES` near the top of `dtt.sh`:
 
-- **Browser lane.** Google, Bing, DDG, Brave, Startpage, Qwant, Mojeek, Yep and friends. Correct but slow; a search costs roughly `ceil(engines / sessions)` browser round-trips. `DTT_NOTTE_SERP_SESSIONS` (default 4) sets the pool size, trading about 500MB per session against search latency. Moving an engine that doesn't actually block you to the direct lane is the cheapest speedup available.
-- **Direct lane.** OpenAlex, Crossref, PubMed, arXiv, OpenAIRE, Wikidata, the package registries, the forum and Q&A engines. Public APIs and structured records with no bot protection, weighted 2.0–3.0 so primary sources outrank general web hits. A browser here would add twenty seconds and buy nothing.
+- **Browser lane.** Google, Google Scholar, Bing, DDG, Brave, Startpage, Yep, Yahoo. Correct but slow; a search costs roughly `ceil(engines / sessions)` browser round-trips. `DTT_NOTTE_SERP_SESSIONS` (default 4) sets the pool size, trading about 500MB per session against search latency. Each engine also declares how it should be fetched: most want `fetch`, which returns the response body their parser expects, while Google only serves real results to a `navigate` and hands a fetch the same stub it gives a plain HTTP client.
+- **Direct lane.** OpenAlex, Crossref, PubMed, arXiv, OpenAIRE, Mwmbl, Wikipedia, the package registries, the forum and Q&A engines. Public APIs and structured records with no bot protection, weighted 2.0–3.0 so primary sources outrank general web hits. A browser here would add twenty seconds and buy nothing.
+
+Three engines are deliberately absent. Qwant's API answers 403 to everything, browser or not. Mojeek sits behind an ALTCHA challenge that needs a human click. Google News links results through relative `./read/` redirects rather than real URLs. Wikidata is out too: its SPARQL preflight only works with a contact User-Agent (hence `useragent_suffix`), and even once it starts it returns nothing, while Wikipedia answers the same queries.
 
 The config also drops the old `keep_only` list, which had pruned all ~330 other engines and left `!bang` syntax pointing at engines that no longer existed, and sets `default_lang: all` because `en` was silently discarding non-English primary sources. `oa_doi_rewrite` sends paywalled DOIs to an open-access copy, and the `hostnames` plugin demotes the SEO/AI-listicle hosts that now crowd general SERPs.
 

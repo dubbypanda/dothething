@@ -634,22 +634,43 @@ NOTTE_SERP_SESSIONS = 4
 # Every entry here costs a slot in the browser pool, so moving an engine that
 # doesn't actually wall us — mojeek and yep don't — to SEARXNG_DIRECT_ENGINES
 # makes searches faster with no loss of coverage.
+# (name, upstream module, how the bridge should fetch it).
+#
+# "fetch" issues the request with fetch() from a page already on the engine's
+# origin, which returns the response body the engine's own parser expects.
+# "navigate" drives the browser to the URL and takes the rendered DOM instead:
+# Google answers a fetch() with the same "enable JavaScript" stub it gives a
+# plain HTTP client and only serves real results to a navigation. The rendered
+# DOM costs the upstream parser (Google's result links are empty until script
+# runs), so those land on the generic extractor in notte_serp.
 SEARXNG_NOTTE_ENGINES = [
-    ("google", "google"),
-    ("google news", "google_news"),
-    ("google scholar", "google_scholar"),
-    ("google images", "google_images"),
-    ("bing", "bing"),
-    ("bing news", "bing_news"),
-    ("duckduckgo", "duckduckgo"),
-    ("brave", "brave"),
-    ("startpage", "startpage"),
-    ("qwant", "qwant"),
-    ("mojeek", "mojeek"),
-    ("yep", "yep"),
-    ("mwmbl", "mwmbl"),
-    ("yahoo", "yahoo"),
+    ("google", "google", "navigate"),
+    ("google scholar", "google_scholar", "navigate"),
+    # Asks Google for JSON rather than a SERP, so it wants the response body,
+    # not a rendered page — navigating there just lands on the JSON viewer.
+    ("google images", "google_images", "fetch"),
+    ("bing", "bing", "fetch"),
+    ("bing news", "bing_news", "fetch"),
+    ("duckduckgo", "duckduckgo", "fetch"),
+    ("brave", "brave", "fetch"),
+    ("startpage", "startpage", "fetch"),
+    ("yep", "yep", "fetch"),
+    ("yahoo", "yahoo", "fetch"),
 ]
+
+# Per-engine timeout overrides, for engines upstream has set tighter than the
+# work they actually do.
+SEARXNG_ENGINE_TIMEOUTS = {
+    "mwmbl": 10.0,
+}
+
+# Engines whose browser session belongs on a different host than the URL being
+# fetched. Qwant's API answers 403 to a session established on api.qwant.com
+# (which serves nothing but a 404) and 200 to one established on the web front
+# end, so the session goes to the front end and the API call is cross-origin.
+SERP_SESSION_ORIGINS = {
+    "api.qwant.com": "https://www.qwant.com",
+}
 
 # Fetched directly by SearXNG. Public APIs and structured records with no bot
 # protection: a browser would add 20s per query and buy nothing. The weights
@@ -657,6 +678,9 @@ SEARXNG_NOTTE_ENGINES = [
 # the cheap answer to SERPs increasingly full of AI-written listicles.
 # (name, weight or None).
 SEARXNG_DIRECT_ENGINES = [
+    # Answers a plain client with 200 and no bot check, so a browser here would
+    # only add a round-trip and hold a session another engine needs.
+    ("mwmbl", 1.3),
     ("openalex", 3.0),
     ("crossref", 2.5),
     ("pubmed", 2.5),
@@ -665,7 +689,6 @@ SEARXNG_DIRECT_ENGINES = [
     ("openairepublications", 2.0),
     ("openairedatasets", 2.0),
     ("wikipedia", None),
-    ("wikidata", None),
     ("wikibooks", None),
     ("github", None),
     ("gitlab", None),
@@ -688,7 +711,7 @@ SEARXNG_DIRECT_ENGINES = [
 
 # Ranking priority for merged results (see _build_search_engine_priority).
 SEARXNG_ENABLED_ENGINES = (
-    [name for name, _ in SEARXNG_NOTTE_ENGINES]
+    [entry[0] for entry in SEARXNG_NOTTE_ENGINES]
     + [name for name, _ in SEARXNG_DIRECT_ENGINES]
 )
 
@@ -1027,9 +1050,10 @@ enable_http = True
 upstream = ""
 notte_url = ""
 notte_token = ""
+notte_mode = "fetch"
 
 # Keys that are ours, not the upstream engine's.
-_OURS = ("engine", "upstream", "notte_url", "notte_token")
+_OURS = ("engine", "upstream", "notte_url", "notte_token", "notte_mode")
 
 _engine = None
 
@@ -1078,7 +1102,47 @@ def setup(engine_data):
     if callable(upstream_init):
         globals()["init"] = upstream_init
 
+    # Some engines fetch a token of their own before the search: startpage
+    # scrapes an sc_code off the home page, and gets captcha-redirected doing
+    # it. Those calls bypass everything above, because the engine binds
+    # searx.network's get at import time and calls it directly. Rebinding the
+    # name in the upstream's namespace sends them through the browser too.
+    # Safe to do per instance: load_module gives every engine its own module
+    # object, so this cannot leak into an engine we aren't bridging.
+    if getattr(_engine, "get", None) is not None:
+        _engine.get = _bridged_get
+
     return True
+
+
+def _bridged_get(url, **kwargs):
+    """searx.network.get, rerouted through the browser.
+
+    Blocking on purpose — the engine calls this synchronously from its own
+    worker thread and expects a response object back.
+    """
+    import httpx  # noqa: PLC0415
+
+    try:
+        timeout = float(kwargs.get("timeout") or 20.0)
+    except (TypeError, ValueError):
+        timeout = 20.0
+
+    headers = {}
+    if notte_token:
+        headers["Authorization"] = "Bearer " + notte_token
+    reply = httpx.post(
+        notte_url,
+        json={"url": str(url), "engine": upstream,
+              "timeout_ms": int(timeout * 1000)},
+        headers=headers,
+        timeout=timeout + 15,
+    )
+    payload = reply.json()
+    if payload.get("error"):
+        raise RuntimeError("notte[{0}] preflight: {1}".format(upstream, payload["error"]))
+    return _BridgedResponse(payload.get("html") or "",
+                            payload.get("url") or str(url), {})
 
 
 def request(query, params):
@@ -1092,16 +1156,34 @@ def request(query, params):
         params["url"] = ""
         return params
 
-    params["url"] = notte_url
-    params["method"] = "POST"
-    params["data"] = {}
-    params["content"] = b""
-    params["json"] = {
+    # Carry the upstream's own method and body across. Startpage searches by
+    # POSTing a form (the sc token rides in it), so dropping the body here
+    # would turn its search into a GET of the bare endpoint.
+    payload = {
         "url": target,
         "engine": upstream,
         "headers": inner.get("headers") or {},
         "timeout_ms": int(float(params.get("timeout") or 30) * 1000),
+        "method": str(inner.get("method") or "GET").upper(),
+        "mode": notte_mode,
     }
+    if payload["method"] == "POST":
+        if inner.get("data"):
+            payload["form"] = {str(k): str(v) for k, v in inner["data"].items()}
+        elif inner.get("json"):
+            payload["body_json"] = inner["json"]
+        elif inner.get("content"):
+            content = inner["content"]
+            payload["body_text"] = (
+                content.decode("utf-8", "replace")
+                if isinstance(content, (bytes, bytearray)) else str(content)
+            )
+
+    params["url"] = notte_url
+    params["method"] = "POST"
+    params["data"] = {}
+    params["content"] = b""
+    params["json"] = payload
     if notte_token:
         params["headers"]["Authorization"] = "Bearer " + notte_token
     params["allow_redirects"] = True
@@ -1243,7 +1325,16 @@ def response(resp):
 
     if results:
         return results
-    return _generic_results(html, final_url)
+
+    # Only navigate-mode engines fall back to the generic extractor. Those
+    # hand their parser a rendered DOM it was never written for, so an empty
+    # result there means the parser couldn't read the page, not that the page
+    # was empty. In fetch mode the upstream parser sees exactly the bytes it
+    # expects, so nothing found means nothing there — and scraping the page
+    # anyway just returns navigation chrome dressed up as results.
+    if notte_mode == "navigate":
+        return _generic_results(html, final_url)
+    return []
 '''
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1284,13 +1375,14 @@ class SearXNG:
         if serp_bridge and serp_bridge.url:
             # These entries merge by name onto the upstream defaults, so each
             # engine keeps its shortcut and category and only swaps transport.
-            for name, module in SEARXNG_NOTTE_ENGINES:
+            for name, module, mode in SEARXNG_NOTTE_ENGINES:
                 engines.append({
                     "name": name,
                     "engine": "notte_serp",
                     "upstream": module,
                     "notte_url": serp_bridge.url,
                     "notte_token": serp_bridge.token,
+                    "notte_mode": mode,
                     "inactive": False,
                     "disabled": False,
                     # The browser is the slow part; SearXNG clamps this to
@@ -1300,7 +1392,7 @@ class SearXNG:
         else:
             # No bridge: fall back to SearXNG's own httpx fetches. Google and
             # friends will mostly wall these, but the direct lane still works.
-            for name, _module in SEARXNG_NOTTE_ENGINES:
+            for name, _module, _mode in SEARXNG_NOTTE_ENGINES:
                 engines.append({"name": name, "inactive": False, "disabled": False})
 
         for name, weight in SEARXNG_DIRECT_ENGINES:
@@ -1308,6 +1400,11 @@ class SearXNG:
             if weight is not None:
                 entry["weight"] = weight
             engines.append(entry)
+
+        for entry in engines:
+            override = SEARXNG_ENGINE_TIMEOUTS.get(entry["name"])
+            if override is not None:
+                entry["timeout"] = override
 
         cfg = {
             # No keep_only: it pruned every engine not named here, which threw
@@ -1355,6 +1452,14 @@ class SearXNG:
                 "pool_connections": 200,
                 "pool_maxsize": 50,
                 "enable_http2": True,
+                # Wikimedia's user-agent policy wants a client to identify
+                # itself with a contact. Unsuffixed, wikidata's SPARQL calls
+                # go out as bare "SearXNG/1.0.0" and query.wikidata.org 403s
+                # every one of them, which kills the engine at startup — its
+                # init does a SPARQL preflight. Only reaches engines that
+                # self-identify; the general SERP engines still use the random
+                # browser agent, so this does not out them as a bot.
+                "useragent_suffix": "dothething (+https://dotheth.ing)",
             },
             # Replaces the default set wholesale, so this lists everything we
             # want on, not just the changes.
@@ -1836,7 +1941,8 @@ class Browser:
           finally:
             await self._save_cookies(session)
 
-    async def fetch_serp(self, url, timeout_ms=30000):
+    async def fetch_serp(self, url, timeout_ms=30000, method="GET",
+                         form=None, body_json=None, body_text=None, mode="fetch"):
         """Fetch `url` from inside a real browser page and return the body.
 
         Deliberately not a navigation. Google serves a browser a JS-driven
@@ -1855,7 +1961,9 @@ class Browser:
         origin = ""
         try:
             parts = urlsplit(url)
-            origin = f"{parts.scheme}://{parts.netloc}"
+            origin = SERP_SESSION_ORIGINS.get(
+                parts.netloc.lower(), f"{parts.scheme}://{parts.netloc}"
+            )
         except Exception:
             pass
 
@@ -1876,26 +1984,57 @@ class Browser:
                     page = session.window.page
                     await self._settle_page(session, page, min(timeout_ms, 20000))
 
+                budget = max(5000, min(timeout_ms, 60000))
+
+                if mode == "navigate":
+                    # Google hands a fetch() the same "enable JavaScript" stub
+                    # it gives a plain HTTP client, and only serves the real
+                    # results to a navigation.
+                    result = await session.aexecute(type="goto", url=url)
+                    if not result.success:
+                        raise RuntimeError(f"navigation failed: {result.message}")
+                    page = session.window.page
+                    await self._settle_page(session, page, budget)
+                    return {"html": await page.content(), "url": page.url, "status": 200}
+
                 # Bounded on both sides: SearXNG gives up on the engine at its
                 # own timeout, and a fetch still running after that would pin
                 # this session out of the pool for every later search.
-                budget = max(5000, min(timeout_ms, 60000))
                 payload = await asyncio.wait_for(
                     page.evaluate(
-                        """async ([target, budget]) => {
+                        """async (args) => {
+                            const opts = {
+                                method: args.method || "GET",
+                                credentials: "include",
+                                redirect: "follow",
+                                signal: AbortSignal.timeout(args.budget),
+                            };
+                            if (args.form) {
+                                // URLSearchParams sets the form content-type
+                                // for us, which is what these endpoints want.
+                                opts.body = new URLSearchParams(args.form);
+                            } else if (args.bodyJson) {
+                                opts.body = JSON.stringify(args.bodyJson);
+                                opts.headers = {"Content-Type": "application/json"};
+                            } else if (args.bodyText) {
+                                opts.body = args.bodyText;
+                            }
                             try {
-                                const r = await fetch(target, {
-                                    credentials: "include",
-                                    redirect: "follow",
-                                    signal: AbortSignal.timeout(budget),
-                                });
+                                const r = await fetch(args.url, opts);
                                 return {ok: true, status: r.status, url: r.url,
                                         text: await r.text()};
                             } catch (e) {
                                 return {ok: false, error: String(e)};
                             }
                         }""",
-                        [url, budget],
+                        {
+                            "url": url,
+                            "budget": budget,
+                            "method": (method or "GET").upper(),
+                            "form": form or None,
+                            "bodyJson": body_json,
+                            "bodyText": body_text,
+                        },
                     ),
                     timeout=(budget / 1000) + 5,
                 )
@@ -2051,7 +2190,13 @@ class NotteSerpBridge:
         browser = await self._pool.get()
         try:
             result = await browser.fetch_serp(
-                url, timeout_ms=max(5000, min(timeout_ms, 60000))
+                url,
+                timeout_ms=max(5000, min(timeout_ms, 60000)),
+                method=str(payload.get("method") or "GET").upper(),
+                form=payload.get("form"),
+                body_json=payload.get("body_json"),
+                body_text=payload.get("body_text"),
+                mode=str(payload.get("mode") or "fetch"),
             )
             return {
                 "html": result.get("html") or "",
@@ -3623,11 +3768,11 @@ TOOLS = [
                         "description": (
                             "Comma-separated SearXNG engine names. Default: all enabled "
                             "engines. General web: google, bing, duckduckgo, brave, "
-                            "startpage, qwant, mojeek, yep, mwmbl, yahoo (these fetch "
+                            "startpage, yep, yahoo, google scholar (these fetch "
                             "through a browser, so they are slower — narrow to one or "
                             "two when you only need general results). Primary sources, "
                             "much faster and better for research: openalex, crossref, "
-                            "pubmed, arxiv, semantic scholar, wikidata, wikipedia. "
+                            "pubmed, arxiv, semantic scholar, mwmbl, wikipedia. "
                             "Code and packages: github, gitlab, codeberg, stackoverflow, "
                             "pypi, npm, crates.io. Discussion: hackernews, lobste.rs, "
                             "crowdview, boardreader."
@@ -5981,7 +6126,26 @@ class Agent:
         )
         if resp.status_code != 200:
             return []
-        results = resp.json().get("results", [])
+        payload = resp.json()
+        results = payload.get("results", [])
+
+        # Wikipedia and the other reference engines answer with an infobox
+        # rather than a row in `results`, so reading only `results` threw away
+        # the entire contribution of the engines best placed to define a term.
+        for box in payload.get("infoboxes") or []:
+            url = box.get("id") or ""
+            if not url:
+                urls = box.get("urls") or []
+                url = (urls[0].get("url") if urls else "") or ""
+            if not url:
+                continue
+            results.append({
+                "title": box.get("infobox") or "",
+                "url": url,
+                "content": box.get("content") or "",
+                "engine": box.get("engine") or "infobox",
+            })
+
         for result in results:
             result.setdefault("provider", "searxng")
         return _rank_and_dedupe_search_results(

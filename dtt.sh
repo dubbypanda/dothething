@@ -2446,6 +2446,15 @@ class InputHandler:
         self._watching = False
         self._old_settings = None
         self._thread = None
+        self._in_prompt = False
+
+    def is_active(self):
+        """True while the watcher thread is still running or an input bar is
+        open. Only meaningful after stop(): stop() just flags the thread down —
+        it cannot interrupt an input bar the user is mid-way through typing in,
+        so callers that want the terminal must wait for this to clear."""
+        t = self._thread
+        return self._in_prompt or bool(t and t.is_alive())
 
     def start(self):
         if not self.enabled:
@@ -2481,6 +2490,13 @@ class InputHandler:
                     pass
 
     def _prompt_user(self, prepend='', queued=False):
+        self._in_prompt = True
+        try:
+            self._prompt_user_inner(prepend=prepend, queued=queued)
+        finally:
+            self._in_prompt = False
+
+    def _prompt_user_inner(self, prepend='', queued=False):
         label = "Queued" if queued else "Live"
         sys.stderr.write(
             f"\n\033[1;33m[ {label} Input ]\033[0m\n"
@@ -6361,26 +6377,81 @@ class Agent:
         if placeholder:
             print(f"\033[90m  (hint: {placeholder})\033[0m", file=sys.stderr)
 
+        def _injected_answer():
+            # Text typed into the live-input bar (or queued with Ctrl-Q) while
+            # a question is pending IS the user's answer. Without this bridge
+            # it sits undrained until the run loop resumes — which can't happen
+            # until this tool returns — so the prompt below burns its whole
+            # timeout while the user believes they already answered (observed
+            # live: a multi-minute stall on a sudo question).
+            texts = [t for t in (self.input_handler.drain_live()
+                                 + self.input_handler.drain_queued()) if t.strip()]
+            return "\n".join(texts) if texts else None
+
+        early = _injected_answer()
+        if early:
+            print("\033[32m  ↪ Using your injected input as the answer.\033[0m", file=sys.stderr)
+            self.spinner.start("Resuming...")
+            return early
+
         if not sys.stdin.isatty():
             return f"(non-interactive session — no response after {timeout_seconds}s — proceeding with best judgment)"
 
-        # Temporarily restore terminal if InputHandler changed it
+        try:
+            deadline = time.time() + max(5, int(float(timeout_seconds or 120)))
+        except (TypeError, ValueError):
+            deadline = time.time() + 120
+
+        # stop() only flags the watcher down; if the user is mid-way through
+        # typing in an input bar, that bar still owns the terminal until they
+        # finish. Wait it out instead of drawing a second prompt over it.
         self.input_handler.stop()
         try:
+            while self.input_handler.is_active() and time.time() < deadline:
+                await asyncio.sleep(0.1)
+            answer = _injected_answer()
+            if answer:
+                print("\033[32m  ↪ Using your injected input as the answer.\033[0m", file=sys.stderr)
+                return answer
+
             from prompt_toolkit import PromptSession
             session = PromptSession()
-            response = await asyncio.wait_for(
-                session.prompt_async(
-                    "  > ",
-                    is_password=secret,
-                ),
-                timeout=timeout_seconds
+            prompt_task = asyncio.ensure_future(
+                session.prompt_async("  > ", is_password=secret)
             )
+
+            async def _watch_injected():
+                # Belt and braces for any late arrival that slipped past the
+                # checks above (e.g. a bar that closed between them).
+                while True:
+                    got = _injected_answer()
+                    if got is not None:
+                        return got
+                    await asyncio.sleep(0.25)
+
+            watch_task = asyncio.ensure_future(_watch_injected())
+            done, pending = await asyncio.wait(
+                {prompt_task, watch_task},
+                timeout=max(1.0, deadline - time.time()),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for t in pending:
+                t.cancel()
+            # Let cancelled tasks finish tearing down (prompt_toolkit restores
+            # the terminal during cancellation).
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+
+            if watch_task in done:
+                print("\033[32m  ↪ Using your injected input as the answer.\033[0m", file=sys.stderr)
+                response = watch_task.result()
+            elif prompt_task in done:
+                response = prompt_task.result()
+            else:
+                return f"(no response after {timeout_seconds}s — proceeding with best judgment)"
             if secret:
                 self.events.emit("tool_end", name="request_user_input", result_len=len("(secret)"))
-            return response.strip() if response else "(no response — proceeding with best judgment)"
-        except asyncio.TimeoutError:
-            return f"(no response after {timeout_seconds}s — proceeding with best judgment)"
+            return response.strip() if response and response.strip() else "(no response — proceeding with best judgment)"
         except (EOFError, KeyboardInterrupt):
             return "(user cancelled input — proceeding with best judgment)"
         finally:

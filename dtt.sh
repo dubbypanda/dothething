@@ -397,17 +397,42 @@ if [ ! -f "$DTT_CACHE/.deps_v7" ]; then
 fi
 
 # ── SearXNG in its own venv ──────────────────────────────────────
-if [ ! -f "$DTT_CACHE/.searxng_v4" ]; then
+if [ ! -f "$DTT_CACHE/.searxng_v5" ]; then
     echo "▸ Installing SearXNG (first run — takes 1-2 min)..."
-    # v4 bump: force a fresh clone so earlier versions that trampled
-    # searx/settings.yml get a clean default back.
+    # v5 bump: force a fresh clone. v4 and earlier installed once and then
+    # pinned that checkout forever, so engine fixes never arrived.
     rm -rf "$DTT_CACHE/searxng"
     git clone --depth 1 -q https://github.com/searxng/searxng.git "$DTT_CACHE/searxng"
     [ ! -f "$DTT_CACHE/searxng_venv/bin/activate" ] && python3 -m venv "$DTT_CACHE/searxng_venv"
     "$DTT_CACHE/searxng_venv/bin/pip" install -q -U pip setuptools wheel pyyaml msgspec typing_extensions 2>/dev/null
     "$DTT_CACHE/searxng_venv/bin/pip" install -q pdm 2>/dev/null || true
     "$DTT_CACHE/searxng_venv/bin/pip" install -q --use-pep517 --no-build-isolation -e "$DTT_CACHE/searxng" 2>/dev/null
-    touch "$DTT_CACHE/.searxng_v4"
+    date +%s > "$DTT_CACHE/.searxng_last_update"
+    touch "$DTT_CACHE/.searxng_v5"
+else
+    # Weekly refresh. SearXNG's per-engine parsers chase SERP layouts that
+    # change often, so a checkout that never moves quietly rots: engines start
+    # returning nothing and there's no error to notice.
+    _sx_last=$(cat "$DTT_CACHE/.searxng_last_update" 2>/dev/null || echo 0)
+    _sx_now=$(date +%s)
+    if [ "$((_sx_now - _sx_last))" -ge 604800 ]; then
+        echo "$_sx_now" > "$DTT_CACHE/.searxng_last_update"
+        (
+            set +e
+            cd "$DTT_CACHE/searxng" 2>/dev/null || exit 0
+            _sx_before=$(git rev-parse HEAD 2>/dev/null)
+            git fetch --depth 1 -q origin master 2>/dev/null || exit 0
+            git reset --hard -q FETCH_HEAD 2>/dev/null || exit 0
+            _sx_after=$(git rev-parse HEAD 2>/dev/null)
+            if [ "$_sx_before" != "$_sx_after" ]; then
+                echo "▸ Updated SearXNG to $(echo "$_sx_after" | cut -c1-8)" >&2
+                # Editable install, so code is already live — this only picks
+                # up dependency changes.
+                "$DTT_CACHE/searxng_venv/bin/pip" install -q --use-pep517 \
+                    --no-build-isolation -e "$DTT_CACHE/searxng" 2>/dev/null
+            fi
+        ) || true
+    fi
 fi
 
 # ── Notte browser framework ────────────────────────────────────

@@ -628,6 +628,9 @@ def _kill_process_group(proc):
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
 MAX_INLINE_BYTES = 5 * 1024 * 1024
+# Above this much rendered body text, a captcha widget on the page is furniture
+# (a comment form, a signup box) rather than a wall standing in front of it.
+CHALLENGE_MAX_BODY_TEXT = 2000
 DEFAULT_HEADLESS_VIEWPORT_WIDTH = 1280
 DEFAULT_HEADLESS_VIEWPORT_HEIGHT = 1080
 # How many browser sessions the SERP bridge runs. SearXNG queries every engine
@@ -1809,6 +1812,7 @@ class Browser:
                     url: location.href || "",
                     text,
                     textLength: text.length,
+                    bodyTextLength: (document.body?.innerText || "").length,
                     hasChallengeSelector: challengeSelectors.some((s) => document.querySelector(s)),
                     hasLoadingSelector: loadingSelectors.some((s) => document.querySelector(s)),
                 };
@@ -1816,7 +1820,17 @@ class Browser:
         except Exception:
             state = {}
         text = str(state.get("text") or "")
-        state["challenge"] = bool(state.get("hasChallengeSelector")) or self._looks_like_captcha(text)
+        signal = bool(state.get("hasChallengeSelector")) or self._looks_like_captcha(text)
+        # A wall replaces the page; a captcha widget can also just sit on a
+        # perfectly good one. nothingbutknives puts Turnstile on a form and
+        # matched '[id*="turnstile"]' with 34k characters of article rendered,
+        # so on the selector alone we threw the whole article away. Interstitials
+        # are near-empty by nature — the ones seen here run 190 to 270
+        # characters — so only call it a challenge when the content is missing
+        # too. Erring this way returns a wall's text to the model at worst,
+        # which beats discarding a page that was never blocked.
+        body_len = int(state.get("bodyTextLength") or 0)
+        state["challenge"] = signal and body_len < CHALLENGE_MAX_BODY_TEXT
         state["loading"] = bool(state.get("hasLoadingSelector")) or self._looks_like_loading(text)
         return state
 
@@ -1997,7 +2011,10 @@ class Browser:
                     except Exception:
                         pass
 
-                if self._looks_like_captcha(markdown):
+                # Same guard as _page_state: an article that merely mentions
+                # Cloudflare is not a Cloudflare wall. Only short pages qualify.
+                if (len(markdown or "") < CHALLENGE_MAX_BODY_TEXT
+                        and self._looks_like_captcha(markdown)):
                     solved_key = bool(os.environ.get("TWOCAPTCHA_API_KEY"))
                     if solved_key:
                         try:
@@ -2010,7 +2027,8 @@ class Browser:
                             markdown = await session.ascrape(only_main_content=True)
                         except Exception:
                             pass
-                    if self._looks_like_captcha(markdown):
+                    if (len(markdown or "") < CHALLENGE_MAX_BODY_TEXT
+                            and self._looks_like_captcha(markdown)):
                         advice = (
                             "The solver ran and did not clear it, so this is an "
                             "interactive challenge it can't do — try a different "

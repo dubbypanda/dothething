@@ -3,7 +3,7 @@
 # https://github.com/fluffypony/dothething | https://dotheth.ing
 set -euo pipefail
 
-DTT_VERSION="2.6.0"
+DTT_VERSION="2.7.0"
 _dtt_s="$0"
 [[ "$_dtt_s" != */* ]] && _dtt_s="$(command -v "$_dtt_s" 2>/dev/null || echo "$_dtt_s")"
 DTT_SELF="$(realpath "$_dtt_s" 2>/dev/null || echo "$(cd "$(dirname "$_dtt_s")" && pwd -P)/$(basename "$_dtt_s")")"
@@ -448,7 +448,7 @@ fi
 # Previously this installed @main behind a one-shot marker, meaning each user
 # ended up on whatever main happened to be the day they first ran dtt, and
 # never moved off it.
-NOTTE_PIN="202cf18539cee45f31b16fc0c7f1960a3b5ad409"
+NOTTE_PIN="c697cd9596cb9809a41538ff8f2c02429335810c"
 
 if [ "$(cat "$DTT_CACHE/.notte_pin" 2>/dev/null)" != "$NOTTE_PIN" ]; then
     echo "▸ Installing/updating Notte browser framework..."

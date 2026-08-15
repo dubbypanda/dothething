@@ -740,6 +740,57 @@ SEARXNG_LOW_PRIORITY_HOSTS = [
     r"(.*\.)?[a-z0-9-]*(deals|coupon|discount)[a-z0-9-]*\..*$",
 ]
 
+# Headers for fetches made without the browser. httpx identifies itself as
+# "python-httpx/x.y" by default, which Cloudflare and most WAFs refuse before
+# they even look at the request — knifecenter and bladereviews both answer 403
+# to that and 200 to these. The browser path reads the same pages anyway; all
+# this does is stop the cheap path from being turned away for announcing
+# itself as a script.
+PLAIN_FETCH_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
+    ),
+    "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+               "image/avif,image/webp,*/*;q=0.8"),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+}
+
+# Response markers that mean "a bot wall answered", not "the page said this".
+# Checked against the status line and a slice of the body, so keep them
+# specific enough that an article about Cloudflare doesn't trip them.
+BLOCKED_RESPONSE_MARKERS = (
+    "just a moment",
+    "checking your browser",
+    "enable javascript and cookies to continue",
+    "cf-browser-verification",
+    "challenge-platform",
+    "cf_chl_opt",
+    "attention required",
+    "verifying you are human",
+    "we're checking if you're a real person",
+)
+
+
+def _looks_blocked(status_code, body):
+    """True when a plain HTTP fetch was answered by a bot wall.
+
+    Used to decide whether the browser is worth spending on. A 4xx alone is
+    not enough — plenty of pages legitimately 404 — but a 403/429, or a
+    challenge interstitial served with a 200, both mean the content is behind
+    a wall a real browser might walk through.
+    """
+    if status_code in (403, 429, 503):
+        return True
+    head = (body or "")[:4000].lower()
+    return any(marker in head for marker in BLOCKED_RESPONSE_MARKERS)
+
+
 def _make_headers(api_key):
     return {
         "Authorization": f"Bearer {api_key}",
@@ -1916,6 +1967,25 @@ class Browser:
                         pass
 
                 markdown = await session.ascrape(only_main_content=True)
+
+                # Main-content extraction picks one block, and on some layouts
+                # it picks the wrong one: a 25k-character review came back as
+                # a 1.3k promo box, which reads to the model as "the page was
+                # empty". When what we kept is a small fraction of what the
+                # page actually shows, take the whole thing instead — too much
+                # text beats the wrong text.
+                try:
+                    visible = await page.evaluate(
+                        "() => document.body ? document.body.innerText.length : 0")
+                except Exception:
+                    visible = 0
+                if visible > 2000 and len(markdown or "") < max(600, visible * 0.25):
+                    try:
+                        full = await session.ascrape(only_main_content=False)
+                        if len(full or "") > len(markdown or ""):
+                            markdown = full
+                    except Exception:
+                        pass
 
                 if self._looks_like_captcha(markdown):
                     if os.environ.get("TWOCAPTCHA_API_KEY"):
@@ -6162,22 +6232,32 @@ class Agent:
 
         # Lightweight text mode — no browser needed
         if mode == "text":
+            escalate = False
             try:
-                resp = await self.http.get(url, timeout=timeout_ms/1000, follow_redirects=True)
-                content_type = resp.headers.get("content-type", "")
-                if "json" in content_type:
-                    return f"[UNTRUSTED EXTERNAL CONTENT — source: {url}]\n\nURL: {url}\n\n{resp.text}"
-                from bs4 import BeautifulSoup
-                soup = BeautifulSoup(resp.text, "lxml")
-                for tag in soup(["script", "style", "nav", "footer", "header",
-                                 "aside", "iframe", "noscript", "svg"]):
-                    tag.decompose()
-                body = soup.body.decode_contents() if soup.body else str(soup)
-                md = re.sub(r"\n{3,}", "\n\n", body).strip()
-                title = soup.title.string if soup.title else url
-                return f"[UNTRUSTED EXTERNAL CONTENT — source: {url}]\n\n# {title}\n\nURL: {url}\n\n{md}"
+                resp = await self.http.get(url, timeout=timeout_ms/1000,
+                                           follow_redirects=True,
+                                           headers=PLAIN_FETCH_HEADERS)
+                # A wall answering is not the same as the page saying no. The
+                # browser walks through most of them, so spend it rather than
+                # hand the model a 403 it will read as "this page is gone".
+                escalate = _looks_blocked(resp.status_code, resp.text)
+                if not escalate:
+                    content_type = resp.headers.get("content-type", "")
+                    if "json" in content_type:
+                        return f"[UNTRUSTED EXTERNAL CONTENT — source: {url}]\n\nURL: {url}\n\n{resp.text}"
+                    from bs4 import BeautifulSoup
+                    soup = BeautifulSoup(resp.text, "lxml")
+                    for tag in soup(["script", "style", "nav", "footer", "header",
+                                     "aside", "iframe", "noscript", "svg"]):
+                        tag.decompose()
+                    body = soup.body.decode_contents() if soup.body else str(soup)
+                    md = re.sub(r"\n{3,}", "\n\n", body).strip()
+                    title = soup.title.string if soup.title else url
+                    return f"[UNTRUSTED EXTERNAL CONTENT — source: {url}]\n\n# {title}\n\nURL: {url}\n\n{md}"
             except Exception as e:
                 return f"Error fetching {url}: {e}"
+            if escalate:
+                mode = "markdown"   # fall through to the browser below
 
         # Check disk cache for markdown/html modes (not screenshots)
         cache_key = (url, mode, extract_selector or "", wait_for or "")
@@ -6411,7 +6491,11 @@ class Agent:
 
     async def _tool_http_request(self, url, method="GET", headers=None, body=None,
                                   content_type=None, timeout=30, save_to=None, **kw):
-        req_headers = dict(headers or {})
+        # Browser-ish defaults for the same reason text mode uses them: the
+        # httpx default agent is refused outright by a lot of sites. Anything
+        # the caller passes wins, so an API call can still identify itself.
+        req_headers = dict(PLAIN_FETCH_HEADERS)
+        req_headers.update(headers or {})
         if content_type == "json":
             req_headers.setdefault("Content-Type", "application/json")
         elif content_type == "form":

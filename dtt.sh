@@ -1988,16 +1988,30 @@ class Browser:
                         pass
 
                 if self._looks_like_captcha(markdown):
-                    if os.environ.get("TWOCAPTCHA_API_KEY"):
+                    solved_key = bool(os.environ.get("TWOCAPTCHA_API_KEY"))
+                    if solved_key:
                         try:
-                            await session.aexecute(type="captcha_solve")
+                            # Don't trust the return value: the solver reports
+                            # success even when its upload failed. Whether the
+                            # wall actually cleared is decided by re-reading
+                            # the page below.
+                            await session.aexecute(type="captcha_solve",
+                                                   raise_on_failure=False)
                             markdown = await session.ascrape(only_main_content=True)
                         except Exception:
                             pass
                     if self._looks_like_captcha(markdown):
+                        advice = (
+                            "The solver ran and did not clear it, so this is an "
+                            "interactive challenge it can't do — try a different "
+                            "source rather than retrying this URL."
+                            if solved_key else
+                            "Set TWOCAPTCHA_API_KEY to enable automated solving "
+                            "when supported."
+                        )
                         return (
                             f"Error blocked by security verification at {page.url}. "
-                            "Set TWOCAPTCHA_API_KEY to enable automated solving when supported."
+                            f"{advice}"
                         )
 
                 title = await page.title()

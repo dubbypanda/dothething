@@ -441,11 +441,21 @@ else
 fi
 
 # ── Notte browser framework ────────────────────────────────────
-if [ ! -f "$DTT_CACHE/.notte_v3" ]; then
+# Pinned to one commit so a dtt version identifies exactly one browser stack.
+# version_up.sh rewrites this to whatever the fork's main is at release time,
+# which is what carries a Notte fix out to everyone: the marker records the
+# revision actually installed, so a bump here is what triggers the reinstall.
+# Previously this installed @main behind a one-shot marker, meaning each user
+# ended up on whatever main happened to be the day they first ran dtt, and
+# never moved off it.
+NOTTE_PIN="202cf18539cee45f31b16fc0c7f1960a3b5ad409"
+
+if [ "$(cat "$DTT_CACHE/.notte_pin" 2>/dev/null)" != "$NOTTE_PIN" ]; then
     echo "▸ Installing/updating Notte browser framework..."
-    pip install -q --upgrade --force-reinstall --no-cache-dir "notte[camoufox,captcha] @ git+https://github.com/fluffypony/notte.git@main" || { echo "✗ Notte install failed" >&2; exit 1; }
+    pip install -q --upgrade --force-reinstall --no-cache-dir "notte[camoufox,captcha] @ git+https://github.com/fluffypony/notte.git@${NOTTE_PIN}" || { echo "✗ Notte install failed" >&2; exit 1; }
     python -m camoufox fetch || { echo "✗ Camoufox browser fetch failed" >&2; exit 1; }
-    touch "$DTT_CACHE/.notte_v3"
+    echo "$NOTTE_PIN" > "$DTT_CACHE/.notte_pin"
+    rm -f "$DTT_CACHE/.notte_v3"   # superseded by .notte_pin
 fi
 
 # Playwright 1.60's Firefox driver can crash when Firefox reports a page error

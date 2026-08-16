@@ -463,18 +463,32 @@ if [ "$(cat "$DTT_CACHE/.notte_pin" 2>/dev/null)" != "$NOTTE_PIN" ]; then
     # bound the thin root package while notte-browser floated. Installing the
     # packages from one checkout with --no-deps skips those URLs entirely,
     # which makes the pin mean what it says.
+    # Output goes to a log rather than the terminal — git's sideband "remote:"
+    # counters ignore --quiet, and pip's resolver chatter is no use unless
+    # something breaks. On failure the tail is printed, so a real problem is
+    # still legible.
+    notte_log="$BASE/notte_install.log"
+    : > "$notte_log"
+    notte_fail() {
+        echo "✗ $1" >&2
+        echo "  last lines of $notte_log:" >&2
+        tail -20 "$notte_log" >&2
+        exit 1
+    }
+
     notte_src="$DTT_CACHE/notte-src"
     rm -rf "$notte_src"
+    echo "  ▸ fetching Notte ${NOTTE_PIN:0:8}..."
     git clone --quiet --filter=blob:none --no-recurse-submodules \
-        "$NOTTE_REPO" "$notte_src" \
-        || { echo "✗ Could not clone Notte" >&2; exit 1; }
-    git -C "$notte_src" checkout --quiet "$NOTTE_PIN" \
-        || { echo "✗ Notte pin $NOTTE_PIN not found in $NOTTE_REPO" >&2; exit 1; }
+        "$NOTTE_REPO" "$notte_src" >>"$notte_log" 2>&1 \
+        || notte_fail "Could not clone Notte from $NOTTE_REPO"
+    git -C "$notte_src" checkout --quiet "$NOTTE_PIN" >>"$notte_log" 2>&1 \
+        || notte_fail "Notte pin ${NOTTE_PIN:0:8} not found in $NOTTE_REPO"
 
     # Everything the packages need from PyPI. Read off their own metadata so
     # this doesn't drift when notte changes its requirements.
     notte_reqs="$notte_src/.dtt-third-party-reqs"
-    python - "$notte_src" "$notte_reqs" <<'PY' || { echo "✗ Could not read Notte requirements" >&2; exit 1; }
+    python - "$notte_src" "$notte_reqs" >>"$notte_log" 2>&1 <<'PY' || notte_fail "Could not read Notte requirements"
 import pathlib, sys, tomllib
 
 src, out = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
@@ -494,28 +508,35 @@ for path in paths:
     reqs.update(d for d in deps if not d.lstrip().startswith("notte-"))
 
 out.write_text("\n".join(sorted(reqs)) + "\n")
-print(f"  {len(reqs)} third-party requirements", file=sys.stderr)
 PY
 
     # No --upgrade: the constraints still get enforced, but anything already
     # satisfying them is left alone. With it, pip chases the newest release of
-    # all 42 requirements and everything they pull in, which cost more time
-    # than the six clones this replaced.
-    pip install -q -r "$notte_reqs" \
-        || { echo "✗ Notte dependency install failed" >&2; exit 1; }
+    # every requirement and everything they pull in, which cost more time than
+    # the six clones this replaced.
+    echo "  ▸ installing $(wc -l < "$notte_reqs" | tr -d ' ') dependencies..."
+    pip install -q --disable-pip-version-check -r "$notte_reqs" >>"$notte_log" 2>&1 \
+        || notte_fail "Notte dependency install failed"
 
     notte_paths=""
     for _pkg in $NOTTE_PACKAGES; do
         notte_paths="$notte_paths $notte_src/packages/$_pkg"
     done
+    echo "  ▸ installing Notte packages..."
     # --no-deps: the requirements above already cover PyPI, and without it pip
     # would chase the @main URLs and undo the whole point of the pin.
-    pip install -q --no-deps --force-reinstall $notte_paths "$notte_src" \
-        || { echo "✗ Notte install failed" >&2; exit 1; }
+    pip install -q --disable-pip-version-check --no-deps --force-reinstall \
+        $notte_paths "$notte_src" >>"$notte_log" 2>&1 \
+        || notte_fail "Notte install failed"
 
-    python -m camoufox fetch || { echo "✗ Camoufox browser fetch failed" >&2; exit 1; }
+    # Left unredirected on purpose: on a fresh machine this downloads ~150MB
+    # and its progress bar is the only sign anything is happening.
+    echo "  ▸ checking Camoufox browser..."
+    python -m camoufox fetch || notte_fail "Camoufox browser fetch failed"
+
     echo "$NOTTE_PIN" > "$DTT_CACHE/.notte_pin"
     rm -f "$DTT_CACHE/.notte_v3"   # superseded by .notte_pin
+    echo "  ✓ Notte ${NOTTE_PIN:0:8} installed"
 fi
 
 # Playwright 1.60's Firefox driver can crash when Firefox reports a page error

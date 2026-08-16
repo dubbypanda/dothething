@@ -449,10 +449,70 @@ fi
 # ended up on whatever main happened to be the day they first ran dtt, and
 # never moved off it.
 NOTTE_PIN="c697cd9596cb9809a41538ff8f2c02429335810c"
+NOTTE_REPO="https://github.com/fluffypony/notte.git"
+# Dependency order, so each is present before whatever imports it.
+NOTTE_PACKAGES="notte-core notte-llm notte-browser notte-sdk notte-agent"
 
 if [ "$(cat "$DTT_CACHE/.notte_pin" 2>/dev/null)" != "$NOTTE_PIN" ]; then
     echo "▸ Installing/updating Notte browser framework..."
-    pip install -q --upgrade --force-reinstall --no-cache-dir "notte[camoufox,captcha] @ git+https://github.com/fluffypony/notte.git@${NOTTE_PIN}" || { echo "✗ Notte install failed" >&2; exit 1; }
+    # Clone once and install out of that checkout, rather than handing pip a
+    # git URL. Notte is a monorepo whose packages declare each other as git
+    # dependencies, so `pip install notte@git+...` clones this 75MB repo six
+    # times — measured, 435s just to resolve. Worse, five of those six are
+    # pinned to @main rather than to a revision, so the pin above only ever
+    # bound the thin root package while notte-browser floated. Installing the
+    # packages from one checkout with --no-deps skips those URLs entirely,
+    # which makes the pin mean what it says.
+    notte_src="$DTT_CACHE/notte-src"
+    rm -rf "$notte_src"
+    git clone --quiet --filter=blob:none --no-recurse-submodules \
+        "$NOTTE_REPO" "$notte_src" \
+        || { echo "✗ Could not clone Notte" >&2; exit 1; }
+    git -C "$notte_src" checkout --quiet "$NOTTE_PIN" \
+        || { echo "✗ Notte pin $NOTTE_PIN not found in $NOTTE_REPO" >&2; exit 1; }
+
+    # Everything the packages need from PyPI. Read off their own metadata so
+    # this doesn't drift when notte changes its requirements.
+    notte_reqs="$notte_src/.dtt-third-party-reqs"
+    python - "$notte_src" "$notte_reqs" <<'PY' || { echo "✗ Could not read Notte requirements" >&2; exit 1; }
+import pathlib, sys, tomllib
+
+src, out = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+# Extras dtt relies on: the stealth browser and the captcha solver.
+wanted_extras = {"camoufox", "captcha"}
+paths = [src / "pyproject.toml"] + sorted((src / "packages").glob("*/pyproject.toml"))
+
+reqs = set()
+for path in paths:
+    project = tomllib.loads(path.read_text())["project"]
+    deps = list(project.get("dependencies", []))
+    for name, extra_deps in project.get("optional-dependencies", {}).items():
+        if name in wanted_extras:
+            deps += extra_deps
+    # notte-* entries are the monorepo's own packages; they come from the
+    # checkout, not from an index.
+    reqs.update(d for d in deps if not d.lstrip().startswith("notte-"))
+
+out.write_text("\n".join(sorted(reqs)) + "\n")
+print(f"  {len(reqs)} third-party requirements", file=sys.stderr)
+PY
+
+    # No --upgrade: the constraints still get enforced, but anything already
+    # satisfying them is left alone. With it, pip chases the newest release of
+    # all 42 requirements and everything they pull in, which cost more time
+    # than the six clones this replaced.
+    pip install -q -r "$notte_reqs" \
+        || { echo "✗ Notte dependency install failed" >&2; exit 1; }
+
+    notte_paths=""
+    for _pkg in $NOTTE_PACKAGES; do
+        notte_paths="$notte_paths $notte_src/packages/$_pkg"
+    done
+    # --no-deps: the requirements above already cover PyPI, and without it pip
+    # would chase the @main URLs and undo the whole point of the pin.
+    pip install -q --no-deps --force-reinstall $notte_paths "$notte_src" \
+        || { echo "✗ Notte install failed" >&2; exit 1; }
+
     python -m camoufox fetch || { echo "✗ Camoufox browser fetch failed" >&2; exit 1; }
     echo "$NOTTE_PIN" > "$DTT_CACHE/.notte_pin"
     rm -f "$DTT_CACHE/.notte_v3"   # superseded by .notte_pin

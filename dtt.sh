@@ -2039,7 +2039,10 @@ class Browser:
                     await page.wait_for_timeout(200)
                     data = await page.screenshot(full_page=False)
                 ts = int(time.time() * 1000)
-                out_dir = Path(screenshot_dir) if screenshot_dir else Path.cwd()
+                # Never default to cwd — that is the user's project. Callers
+                # normally pass the per-thread cache; the fallback keeps the
+                # rare thread-less caller out of it too.
+                out_dir = Path(screenshot_dir) if screenshot_dir else BASE / "screenshots"
                 out_dir.mkdir(parents=True, exist_ok=True)
                 path = (out_dir / f"screenshot_{ts}.png").absolute()
                 path.write_bytes(data)
@@ -4952,8 +4955,8 @@ ALWAYS:
 - Use batch_process to fan out work to Gemini 3.5 Flash in parallel
 - Use analyze_data to process/filter/deduplicate large result files
 - Track completion counts explicitly: "Processed 347/500"
-- Write intermediate results to files after every batch — never hold \
-everything in the conversation context
+- Write intermediate results to files in {cache_dir} after every batch — never \
+hold everything in the conversation context
 - Checkpoint progress using notes_add and on-disk files
 - Verify final output meets the expected count before finalizing
 - Calling batch_process many times in sequence (e.g., 75 calls of 20 items \
@@ -4961,15 +4964,15 @@ each to cover 1500 items) IS the correct batch approach. Do not second-guess \
 this pattern. Do not stop and "rethink" — keep going until all items are done.
 
 THE CORRECT PATTERN for large-scale research:
-1. Get/clean the input list -> write to items.json
+1. Get/clean the input list -> write to {cache_dir}/items.json
 2. Deduplicate with run_code (simple script)
 3. Use batch_process or run_code to search/research all items in parallel \
-(hit SearXNG directly, save raw results to raw_results.json)
+(hit SearXNG directly, save raw results to {cache_dir}/raw_results.json)
    For very large lists (500+), split into chunks and call batch_process \
    repeatedly (e.g. 30 calls of 50 items, or 75 calls of 20 items). Use \
    search_query_template with enrich_with_search for targeted research \
-   queries (e.g. "2026 current CEO {{item}}"). Checkpoint results to disk \
-   between batches.
+   queries (e.g. "2026 current CEO {{item}}"). Checkpoint results to \
+   {cache_dir} between batches.
 4. Use analyze_data to extract/structure/deduplicate the results
 5. For items with missing data, run a second targeted pass
 6. Write final output to the deliverable file
@@ -5060,9 +5063,9 @@ research queries.
 17. When the user specifies a minimum count or says "all items" or "every", treat \
 that as a hard acceptance criterion. Track your progress numerically. Verify your \
 count before finalizing. If short, go back for more.
-18. For long-running tasks, write intermediate results to disk after every batch. \
-Use notes_add for progress counts. Use files for data. Your conversation context \
-is ephemeral; disk files are durable.
+18. For long-running tasks, write intermediate results to {cache_dir} after every \
+batch. Use notes_add for progress counts. Use files for data. Your conversation \
+context is ephemeral; disk files are durable.
 19. Messages prefixed with [User input added mid-run] or [Queued user input] are \
 live instructions from the user injected during execution. Treat them as the new \
 highest-priority guidance. Acknowledge briefly and adjust your approach. If the \
@@ -5226,7 +5229,7 @@ into chunks and call batch_process repeatedly — this IS the correct pattern, n
 a workaround. Use enrich_with_search=true with search_query_template for rich \
 auto-research: e.g. search_query_template="2026 current CEO {{item}}" fetches top \
 20 search results with full page content (up to 5000 tokens each) per item. \
-Checkpoint intermediate results to disk between batches.
+Checkpoint intermediate results to {cache_dir} between batches.
 - manage_config: Set/delete env vars in ~/.dtt/env. Use to persist API keys, settings. \
 Values are shell-escaped and redacted automatically.
 - manage_skill: Install skills from git repos, URLs, or raw content into ~/.dtt/skills/. \
@@ -5378,13 +5381,13 @@ WRONG approach (what NOT to do):
 CORRECT approach:
 Turn 1: plan_create + read the input file
 Turn 2: run_code — write a Python script to deduplicate the VC list, save \
-cleaned list to vc_list.json
+cleaned list to {cache_dir}/vc_list.json
 Turn 3: batch_process(
-    items_file="vc_list.json",
+    items_file="{cache_dir}/vc_list.json",
     instruction_template="Research this venture capital firm: {{item}}. Return JSON \
 with fields: name, website, focus_areas, fund_size_usd, key_partners, \
 recent_investments. Use {{search_results}} as your source.",
-    output_file="vc_research_results.json",
+    output_file="{cache_dir}/vc_research_results.json",
     enrich_with_search=true,
     search_query_template="{{item}} venture capital fund size partners investments 2026",
     concurrency=50
@@ -5392,11 +5395,12 @@ recent_investments. Use {{search_results}} as your source.",
 Turn 3b: If too many items for one batch_process call, split into chunks \
 and run batch_process on each chunk sequentially. This is the correct \
 pattern — many batch_process calls are fine.
-Turn 4: analyze_data(file_path="vc_research_results.json",
+Turn 4: analyze_data(file_path="{cache_dir}/vc_research_results.json",
     instructions="Deduplicate entries. Merge partial results. Identify items \
 with missing critical fields. Output clean JSON array.",
-    output_file="vc_clean.json")
-Turn 5: run_code — convert vc_clean.json to final CSV, validate row count
+    output_file="{cache_dir}/vc_clean.json")
+Turn 5: run_code — convert {cache_dir}/vc_clean.json to the final CSV in the \
+working directory (it is the deliverable), validate row count
 Turn 5b: oracle(question="Review my plan for the 800-VC research task. The user \
 wants: name, website, focus area, fund size, key partners. I've completed batch \
 research and deduplication. Am I missing any data quality checks or original \
@@ -5425,6 +5429,8 @@ Thread cache: {cache_dir}
     parsed data, screenshots, partial results, anything you might need later.
   - Use {cache_dir} over /tmp, $HOME, or the working directory for temporary files —
     /tmp may be wiped, and the working directory is the user's project.
+  - The exception is deliverables: files the user asked for go in the working
+    directory (or wherever they specified), never hidden in the cache.
 SearXNG: {searxng_info}
 Notte: Browser framework with stealth Camoufox, content extraction, and captcha solving.
   - fetch_page for deterministic scraping (no LLM cost)

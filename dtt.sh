@@ -5003,11 +5003,12 @@ COMPUTER_USE_TOOL = {
             "native apps and any GUI the shell can't reach. Pass 'command' as the "
             "Peekaboo argument line; dtt runs `peekaboo <command> --json` for you "
             "(no shell, so quote args normally).\n\n"
-            "ALWAYS begin with `see` to screenshot and get an element map: it "
-            "returns labelled elements (B1, T2, …) plus a session, and later "
-            "actions target those labels. Prefer labels over raw coordinates. The "
-            "screenshot is saved to a PNG whose path is returned — read it with "
-            "analyze_image when you need to look.\n\n"
+            "ALWAYS begin with `see` to screenshot and map the UI: it returns "
+            "elements with ids (elem_9, elem_42, …) plus their role, label, and "
+            "position. Then act on them: `click --on elem_9`, or `click \"OK\"` "
+            "to match by label text. Prefer element ids over raw coordinates. "
+            "The screenshot is saved to a PNG whose path is returned — read it "
+            "with analyze_image when you need to actually look at pixels.\n\n"
             "Verbs and their shapes (positional args are bare; the rest are flags):\n"
             "  see [--app <name>|frontmost|menubar] [--mode window|screen]\n"
             "  image [--path <file>] [--mode window|screen]   # raw shot, no map\n"
@@ -8026,6 +8027,40 @@ class Agent:
         if shot_path:
             note = (f"\nScreenshot saved to {shot_path} — "
                     "read it with analyze_image if you need to look.")
+
+        # `see` returns ~200k of JSON, most of it timing spans, with the
+        # element map buried mid-payload — a flat cap starved the model of
+        # exactly the part it acts on. Distill it: identity, counts, then the
+        # elements themselves, actionable first, one line each.
+        if verb == "see" and isinstance(data.get("ui_elements"), list):
+            els = data["ui_elements"]
+            lines = [
+                f"App: {data.get('application_name')} — window: {data.get('window_title')!r}",
+                f"snapshot: {data.get('snapshot_id')}  elements: {data.get('element_count')} "
+                f"({data.get('interactable_count')} actionable)",
+                "Elements (act with e.g. `click --on <id>`; actionable first):",
+            ]
+            def fmt(e):
+                b = e.get("bounds") or {}
+                label = e.get("label") or e.get("role_description") or ""
+                return (f"  {e.get('id','?'):<10} {e.get('role','?'):<10} "
+                        f"{label[:48]!r} @{b.get('x')},{b.get('y')} "
+                        f"{b.get('width')}x{b.get('height')}")
+            actionable = [e for e in els if e.get("is_actionable")]
+            passive = [e for e in els if not e.get("is_actionable")]
+            shown = 0
+            for e in actionable + passive:
+                line = fmt(e)
+                if sum(len(l) + 1 for l in lines) + len(line) > 11000:
+                    break
+                lines.append(line)
+                shown += 1
+            if shown < len(els):
+                omitted = len(els) - shown
+                tail = " (all remaining are non-actionable)" if shown >= len(actionable) else ""
+                lines.append(f"  … {omitted} more elements omitted{tail}")
+            return "\n".join(lines) + note
+
         return json.dumps(data, indent=1, default=str)[:12000] + note
 
     # ── Email (AgentMail) tools ───────────────────────────────────

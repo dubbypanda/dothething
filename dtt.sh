@@ -539,6 +539,39 @@ PY
     echo "  ✓ Notte ${NOTTE_PIN:0:8} installed"
 fi
 
+# ── Peekaboo (macOS computer use) ──────────────────────────────
+# Only on macOS, and only when the user hasn't already got peekaboo on PATH.
+# The universal binary comes straight from GitHub releases — no Homebrew — so
+# it self-installs like everything else. The tools it drives still need the
+# user to grant Screen Recording + Accessibility to their terminal app; that
+# grant is attributed by macOS to the terminal, not to dtt, so it can't be
+# automated here.
+PEEKABOO_PIN="4.2.0"
+if [ "$(uname -s)" = "Darwin" ] && ! command -v peekaboo >/dev/null 2>&1; then
+    if [ "$(cat "$DTT_CACHE/.peekaboo_pin" 2>/dev/null)" != "$PEEKABOO_PIN" ]; then
+        echo "▸ Installing Peekaboo ${PEEKABOO_PIN} (macOS computer use)..."
+        pb_url="https://github.com/openclaw/Peekaboo/releases/download/v${PEEKABOO_PIN}/peekaboo-macos-universal.tar.gz"
+        pb_tmp="$DTT_CACHE/.peekaboo.tar.gz"
+        pb_dir="$DTT_CACHE/peekaboo"
+        if curl -sfL --max-time 120 "$pb_url" -o "$pb_tmp"; then
+            rm -rf "$pb_dir"; mkdir -p "$pb_dir"
+            # --strip-components drops the peekaboo-macos-universal/ wrapper dir.
+            if tar xzf "$pb_tmp" -C "$pb_dir" --strip-components=1 2>/dev/null \
+               && [ -x "$pb_dir/peekaboo" ]; then
+                chmod +x "$pb_dir/peekaboo"
+                echo "$PEEKABOO_PIN" > "$DTT_CACHE/.peekaboo_pin"
+                echo "  ✓ Peekaboo ${PEEKABOO_PIN} installed"
+            else
+                rm -rf "$pb_dir"
+                echo "  ⚠ Peekaboo extract failed — computer-use tools disabled" >&2
+            fi
+            rm -f "$pb_tmp"
+        else
+            echo "  ⚠ Peekaboo download failed — computer-use tools disabled" >&2
+        fi
+    fi
+fi
+
 # Playwright 1.60's Firefox driver can crash when Firefox reports a page error
 # without a source location. Camoufox uses that Firefox path, so patch the
 # bundled JS driver defensively until this is fixed upstream.
@@ -761,6 +794,36 @@ def _kill_process_group(proc):
 
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+
+# Peekaboo drives macOS computer use. Prefer a user's own install on PATH,
+# else the pinned copy the bootstrap dropped in the cache. None of this exists
+# off macOS, so the computer_use tool is simply absent there.
+def _find_peekaboo():
+    if sys.platform != "darwin":
+        return None
+    cached = DTT_CACHE / "peekaboo" / "peekaboo"
+    if cached.exists() and os.access(cached, os.X_OK):
+        return str(cached)
+    found = shutil.which("peekaboo")
+    return found or None
+
+PEEKABOO_BIN = _find_peekaboo()
+
+# Peekaboo verbs worth exposing: the deterministic ones. Its agent/analyze
+# verbs call an LLM, redundant inside an agent that is already one; config,
+# daemon, bridge, clean and friends alter Peekaboo's own state and stay out.
+# The model may write either underscores or hyphens (inspect_ui / inspect-ui).
+PEEKABOO_ACTIONS = frozenset({
+    "see", "image", "list", "inspect-ui", "permissions",
+    "click", "type", "hotkey", "press", "scroll", "move",
+    "drag", "swipe", "paste", "clipboard",
+    "app", "window", "menu", "menubar", "dialog", "dock", "space",
+    "set-value", "perform-action", "open", "sleep",
+})
+# Verbs that capture pixels need Screen Recording; everything else that touches
+# the UI needs Accessibility. A few need nothing.
+PEEKABOO_CAPTURE_ACTIONS = frozenset({"see", "image"})
+PEEKABOO_UNGATED_ACTIONS = frozenset({"permissions", "sleep", "open"})
 MAX_INLINE_BYTES = 5 * 1024 * 1024
 # Above this much rendered body text, a captcha widget on the page is furniture
 # (a comment form, a signup box) rather than a wall standing in front of it.
@@ -4928,6 +4991,63 @@ TOOLS = [
     },
 ]
 
+# Computer use via Peekaboo — macOS only, and only when the binary is present.
+# One tool, not one-per-verb: it keeps the prompt small and the arg shapes are
+# documented here rather than in 26 separate schemas.
+COMPUTER_USE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "computer_use",
+        "description": (
+            "Control this Mac's screen, keyboard, and mouse (Peekaboo) to operate "
+            "native apps and any GUI the shell can't reach. Pass 'command' as the "
+            "Peekaboo argument line; dtt runs `peekaboo <command> --json` for you "
+            "(no shell, so quote args normally).\n\n"
+            "ALWAYS begin with `see` to screenshot and get an element map: it "
+            "returns labelled elements (B1, T2, …) plus a session, and later "
+            "actions target those labels. Prefer labels over raw coordinates. The "
+            "screenshot is saved to a PNG whose path is returned — read it with "
+            "analyze_image when you need to look.\n\n"
+            "Verbs and their shapes (positional args are bare; the rest are flags):\n"
+            "  see [--app <name>|frontmost|menubar] [--mode window|screen]\n"
+            "  image [--path <file>] [--mode window|screen]   # raw shot, no map\n"
+            "  click <query|B3> | click --coords x,y [--double] [--right]\n"
+            '  type "text to type" [--app <name>]\n'
+            "  press <key>          hotkey --keys cmd,c\n"
+            "  scroll --direction up|down|left|right [--amount N] [--on B3]\n"
+            "  move --coords x,y     drag --from B1 --to B2     swipe --from .. --to ..\n"
+            "  app launch|quit|focus|hide|list [<AppName>]\n"
+            "  window focus|close|minimize|maximize|move|resize|list --app <name>\n"
+            '  menu click --app <name> --item "New Window"   |  menu list --app <name>\n'
+            "  dialog list|click|input [...]   dock ...   space ...   menubar ...\n"
+            "  clipboard get | clipboard set --text \"…\"     paste\n"
+            "  inspect_ui [--app <name>]     list apps|windows\n"
+            "  open <url-or-path> [--app <name>]     sleep <seconds>\n"
+            "  permissions          # report which macOS grants are in place\n\n"
+            "If a call reports a missing grant, tell the user to enable it for "
+            "THEIR TERMINAL APP in System Settings > Privacy & Security; macOS "
+            "attributes the grant to the terminal, and dtt cannot set it."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": (
+                        "The Peekaboo argument line, e.g. 'see --app Safari', "
+                        "'app launch Notes', or 'type \"hello\"'. Must start with "
+                        "an allowed verb (see the list above)."
+                    ),
+                },
+                "result_mode": RESULT_MODE_PROP,
+            },
+            "required": ["command"],
+        },
+    },
+}
+if PEEKABOO_BIN:
+    TOOLS.append(COMPUTER_USE_TOOL)
+
 # exec_order goes on every tool except finalize (which must be the only call
 # in its response, so staging is meaningless there).
 for _tool_def in TOOLS:
@@ -5731,6 +5851,8 @@ class Agent:
         "manage_mcp":      "_tool_manage_mcp",
         # User input
         "request_user_input": "_tool_request_user_input",
+        # macOS computer use (Peekaboo) — only registered when present
+        "computer_use":    "_tool_computer_use",
         # Clipboard
         "clipboard_copy":  "_tool_clipboard_copy",
         "clipboard_paste": "_tool_clipboard_paste",
@@ -7811,6 +7933,100 @@ class Agent:
             return "(clipboard is empty)"
         except Exception as e:
             return f"Clipboard paste error: {e}"
+
+    # ── macOS computer use (Peekaboo) ─────────────────────────────
+    async def _peekaboo_missing(self, permission):
+        """Whether a named macOS grant is absent. Returns True/False, or None if
+        the permissions probe itself failed (then we let Peekaboo be the judge)."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                PEEKABOO_BIN, "permissions", "--json",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
+            perms = json.loads(out.decode() or "{}").get("data", {}).get("permissions", [])
+            for p in perms:
+                if p.get("name") == permission:
+                    return not p.get("isGranted", False)
+            return False
+        except Exception:
+            return None
+
+    async def _tool_computer_use(self, command=None, **kw):
+        if not PEEKABOO_BIN:
+            return ("Error: computer_use needs Peekaboo, which only runs on macOS "
+                    "and isn't installed here.")
+        if not command or not str(command).strip():
+            return "Error: computer_use needs a 'command', e.g. 'see --app Safari'."
+
+        try:
+            tokens = shlex.split(str(command))
+        except ValueError as e:
+            return f"Error: could not parse command ({e}). Check your quoting."
+        if not tokens:
+            return "Error: empty command."
+
+        # The verb is the allowlist gate. Normalise _ and - so the model can
+        # write either. Nothing off the list runs — this is what keeps the
+        # LLM/config/daemon verbs out.
+        verb = tokens[0].replace("_", "-")
+        if verb not in PEEKABOO_ACTIONS:
+            return (f"Error: '{tokens[0]}' is not an allowed computer_use verb. "
+                    f"Allowed: {', '.join(sorted(PEEKABOO_ACTIONS))}.")
+        tokens[0] = verb
+
+        # Gate on the specific grant this verb needs. Capture needs Screen
+        # Recording; other UI actions need Accessibility; a few need neither.
+        # The grant is attributed by macOS to the terminal app, so dtt reports
+        # it and cannot set it.
+        if verb not in PEEKABOO_UNGATED_ACTIONS:
+            need = "Screen Recording" if verb in PEEKABOO_CAPTURE_ACTIONS else "Accessibility"
+            if await self._peekaboo_missing(need):
+                return (
+                    f"Error: Peekaboo needs macOS '{need}' permission for '{verb}'. "
+                    "Enable it for YOUR TERMINAL APP (the one running dtt), not for "
+                    "python or peekaboo — macOS attributes the grant to the "
+                    f"terminal. Open System Settings > Privacy & Security > {need}, "
+                    "enable your terminal, then restart it. dtt cannot set this."
+                )
+
+        # Screenshots go to the thread cache, never the user's project, unless
+        # the model named its own --path.
+        shot_path = None
+        if verb in PEEKABOO_CAPTURE_ACTIONS and "--path" not in tokens:
+            out_dir = self.thread_logger.cache_dir if self.thread_logger else BASE
+            shot_path = str(Path(out_dir) / f"peekaboo_{verb}_{int(time.time()*1000)}.png")
+            tokens += ["--path", shot_path]
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                PEEKABOO_BIN, *tokens, "--json",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            out, err = await asyncio.wait_for(proc.communicate(), timeout=90)
+        except asyncio.TimeoutError:
+            return f"Error: computer_use '{verb}' timed out after 90s."
+        except Exception as e:
+            return f"Error running Peekaboo: {e}"
+
+        raw = out.decode(errors="replace").strip()
+        try:
+            payload = json.loads(raw) if raw else {}
+        except Exception:
+            tail = (err.decode(errors="replace").strip() or raw)[:800]
+            return f"Peekaboo {verb}: {tail}" if tail else f"Peekaboo {verb}: (no output)"
+
+        if not payload.get("success", True):
+            e = payload.get("error") or payload.get("message") or "unknown error"
+            msg = e.get("message") if isinstance(e, dict) else e
+            return f"Error: Peekaboo {verb} failed: {msg}"
+
+        data = payload.get("data", payload)
+        note = ""
+        if shot_path:
+            note = (f"\nScreenshot saved to {shot_path} — "
+                    "read it with analyze_image if you need to look.")
+        return json.dumps(data, indent=1, default=str)[:12000] + note
 
     # ── Email (AgentMail) tools ───────────────────────────────────
     async def _tool_email_auth(self, action, human_email=None, username=None, otp_code=None, **kw):

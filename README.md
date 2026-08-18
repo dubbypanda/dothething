@@ -120,6 +120,10 @@ The config also drops the old `keep_only` list, which had pruned all ~330 other 
 
 **MCP servers.** Configure MCP servers in `~/.dtt/mcp.json` (same format as Claude Code). The agent picks up all connected MCP tools at startup. Servers can also be added mid-session via the `manage_mcp` tool.
 
+**Computer use (macOS).** On macOS, dtt gains a `computer_use` tool that drives the screen, keyboard, and mouse through [Peekaboo](https://github.com/openclaw/Peekaboo). It bundles Peekaboo itself, downloading the pinned universal binary into `~/.dtt/cache` on first run, so you don't need Homebrew (if you already have `peekaboo` on your PATH, dtt uses that instead). The agent works by screenshotting the screen, reading the element map, and clicking or typing by element label. Peekaboo's LLM verbs (`agent`, `analyze`) are left out, since dtt is already the model.
+
+Two macOS permissions are required, and macOS attributes both to the app that launched dtt, not to dtt or python: **Screen Recording** (for screenshots) and **Accessibility** (for clicking and typing). Grant them to your terminal in System Settings > Privacy & Security, then restart the terminal. dtt cannot set these for you; if a `computer_use` call reports a missing grant, it names which one and where. Actions that only read the accessibility tree or type text work with Accessibility alone; only screenshots need Screen Recording.
+
 ## Orchestrator mode
 
 `--orchestrator` opens a terminal UI for running multiple agents in parallel. You get:
@@ -176,7 +180,7 @@ dtt --model main=openai/gpt-5.6-sol --model oracle=anthropic/claude-fable-5 "...
 
 **File operations:** `read_file`, `write_file`, `edit_file`, `batch_read`, `diff_files`
 
-**System:** `run_command`, `shell_session`, `run_code`, `glob`, `list_dir`, `search_file`, `clipboard_copy`, `clipboard_paste`, `request_user_input`
+**System:** `run_command`, `shell_session`, `run_code`, `glob`, `list_dir`, `search_file`, `clipboard_copy`, `clipboard_paste`, `computer_use` (macOS GUI control via Peekaboo), `request_user_input`
 
 **Web:** `search_web` (hybrid Serper + SearXNG for general discovery, plus engine/category targeting; general-web engines fetch through Notte), `fetch_page` (Notte-powered scraping), `browser_agent` (full interactive control), `http_request`
 

@@ -62,7 +62,7 @@
         "Interactive browser agent for multi-step flows (browser_agent)",
         "File operations with fuzzy search/replace editing",
         "Shell command execution plus sandboxed Python/Bash/TypeScript",
-        "Vision analysis via Gemini 3.5 Flash",
+        "Vision analysis via the worker model",
         "GPT-5.6 Sol oracle for second opinions",
         "Thread persistence and resume",
         "Live cost tracking per model",
@@ -665,7 +665,7 @@
                             <li><strong>Workflow Architecture</strong>
                             Describe task in plain language → agent drafts numbered plan → executes autonomously → searches web, reads/writes files, runs shell commands → delivers final output.</li>
                             <li><strong>Result Mode</strong>
-                            Every tool call includes a <code>result_mode</code>. "raw" delivers exact output; "goal" string pipes output through a cheaper model (Gemini 3.5 Flash) for focused summary, preserving context window.</li>
+                            Every tool call includes a <code>result_mode</code>. "raw" delivers exact output; "goal" string pipes output through a cheaper worker model (Gemini 3.7 Flash) for focused summary, preserving context window.</li>
                             <li><strong>Stacked Tool Calls</strong>
                             Many tool calls per reply, all parallel by default. An optional <code>exec_order</code> field sequences them into stages: calls sharing a number run together, and the next stage waits for the previous one to finish. "Make a directory, write three files into it, list it" is one round-trip instead of three. If a whole stage fails, everything after it is skipped.</li>
                             <li><strong>Browser Automation</strong>
@@ -687,7 +687,7 @@
                             <li><strong>Prompt Caching</strong>
                             OpenRouter sticky routing plus Anthropic block-level cache controls. Long tasks hit the cache on subsequent turns and input costs drop sharply.</li>
                             <li><strong>Skills &amp; MCP</strong>
-                            Drop any Claude Code <code>SKILL.md</code> into <code>~/.dtt/skills/&lt;name&gt;/</code>. Skills with <code>allowed-tools</code> inject into the system prompt; others run as isolated Gemini 3.5 Flash sub-tasks. MCP servers plug in via <code>~/.dtt/mcp.json</code> (same format as Claude Code).</li>
+                            Drop any Claude Code <code>SKILL.md</code> into <code>~/.dtt/skills/&lt;name&gt;/</code>. Skills with <code>allowed-tools</code> inject into the system prompt; others run as isolated worker-model sub-tasks. MCP servers plug in via <code>~/.dtt/mcp.json</code> (same format as Claude Code).</li>
                             <li><strong>Clipboard</strong>
                             Copies text or images to and pastes from the system clipboard. macOS, Linux (X11 and Wayland), and Windows.</li>
                             <li><strong>Self-Management</strong>
@@ -738,7 +738,7 @@
                     </div>
                     <div class="tool-item">
                         <span class="tool-name">delegate</span>
-                        <div class="tool-desc">Farm sub-tasks to cheaper Gemini 3.5 Flash workers.</div>
+                        <div class="tool-desc">Farm sub-tasks to the cheaper worker model.</div>
                     </div>
                     <div class="tool-item">
                         <span class="tool-name">skills</span>
@@ -750,7 +750,7 @@
                     </div>
                     <div class="tool-item">
                         <span class="tool-name">batch</span>
-                        <div class="tool-desc">batch_process, analyze_data. Parallel Gemini 3.5 Flash workers for bulk jobs.</div>
+                        <div class="tool-desc">batch_process, analyze_data. Parallel worker-model calls for bulk jobs.</div>
                     </div>
                     <div class="tool-item">
                         <span class="tool-name">clipboard</span>

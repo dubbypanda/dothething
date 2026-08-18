@@ -93,7 +93,7 @@ Everything else is installed automatically into `/tmp/dothething` on first run.
 
 The agent routes Claude Fable through OpenRouter. Every turn, the model decides which tools to call, processes the results, and decides what to do next.
 
-**result_mode.** Every tool call has a `result_mode`. If you need exact output, use `"raw"`. If you tell it to "extract all function signatures", it pipes the output through Gemini 3.5 Flash for a tight summary before the main agent sees it. This keeps the context window manageable on long tasks.
+**result_mode.** Every tool call has a `result_mode`. If you need exact output, use `"raw"`. If you tell it to "extract all function signatures", it pipes the output through the worker model for a tight summary before the main agent sees it. This keeps the context window manageable on long tasks.
 
 **Stacked tool calls with exec_order.** The agent can return many tool calls in a single reply. By default they all run in parallel. An optional `exec_order` field on each call sequences them into stages: calls sharing a stage number run concurrently, and the next stage starts once the previous one finishes. Seven calls staged `1,1,2,3,3,3,4` run as two in parallel, then one, then three in parallel, then one. If every call in a stage fails, the later stages are skipped so the agent can correct course. "Make a directory, write three files into it, list the result" completes in one round-trip instead of three.
 
@@ -116,7 +116,7 @@ The config also drops the old `keep_only` list, which had pruned all ~330 other 
 
 **Thread persistence.** Every session saves to `~/.dtt/threads/` with a timestamped ID. If you interrupt a run or hit the loop limit, resume with `--resume <thread-id>`.
 
-**Skills.** Drop skill directories into `~/.dtt/skills/` to teach the agent new procedures. Each skill is a directory containing a `SKILL.md` file (Claude Code convention). Skills with `allowed-tools` in their frontmatter inject directly into the agent's context, so it follows those instructions while using its own tools. Text-processing skills run via Gemini 3.5 Flash as isolated sub-tasks. Skills can also be installed mid-session via the `manage_skill` tool.
+**Skills.** Drop skill directories into `~/.dtt/skills/` to teach the agent new procedures. Each skill is a directory containing a `SKILL.md` file (Claude Code convention). Skills with `allowed-tools` in their frontmatter inject directly into the agent's context, so it follows those instructions while using its own tools. Text-processing skills run via the worker model as isolated sub-tasks. Skills can also be installed mid-session via the `manage_skill` tool.
 
 **MCP servers.** Configure MCP servers in `~/.dtt/mcp.json` (same format as Claude Code). The agent picks up all connected MCP tools at startup. Servers can also be added mid-session via the `manage_mcp` tool.
 
@@ -146,12 +146,12 @@ Set `AGENTMAIL_API_KEY` in your shell or let the agent create one via `email_aut
 
 ## Models
 
-All calls route through OpenRouter. You only need one API key.
+All calls route through OpenRouter. You only need one API key. The default slugs live in [models.txt](https://dotheth.ing/models.txt); dtt fetches that file once a day, so defaults can change without a release. Your `--model` flags and `DTT_MODEL_*` env vars always win over it.
 
 | Role | Default model | Flag to change |
 |---|---|---|
 | Main agent (`main`) | Claude Fable 5 | `--fast` for Opus 4.8-fast; quick mode (`q`) uses Opus 4.8, or Opus 4.8-fast with `--fast` |
-| Summarizer, analysis, delegate (`worker`) | Google Gemini 3.5 Flash | `--model worker=...` |
+| Summarizer, analysis, delegate (`worker`) | Google Gemini 3.7 Flash | `--model worker=...` |
 | Browser agent, Notte (`browser`) | Claude Sonnet 4.6 | `--model browser=...` |
 | Oracle (`oracle`) | GPT-5.6 Sol | `--oraclepro` for GPT-5.6 Sol Pro (not exposed in quick mode) |
 
@@ -198,7 +198,7 @@ Each skill lives in its own directory under `~/.dtt/skills/` as a `SKILL.md` fil
 ---
 name: my-skill
 description: What this skill does
-inline: true          # inject into agent context (vs. delegate to Gemini 3.5 Flash)
+inline: true          # inject into agent context (vs. delegate to the worker model)
 allowed-tools: [Read, Write, Edit]  # implies inline
 disable-model-invocation: true  # hide from agent's skill list
 ---

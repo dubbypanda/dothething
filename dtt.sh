@@ -598,11 +598,64 @@ DTT_CACHE       = Path.home() / ".dtt" / "cache"
 VENV            = DTT_CACHE / "venv"
 DTT_DIR         = Path.home() / ".dtt" / "threads"
 
+# Remote model defaults, fetched from the website once a day. Lets the model
+# lineup change without shipping a new dtt version. Precedence stays:
+# --model flags > DTT_MODEL_* env vars > models.txt > the baked-in fallbacks
+# passed to _model_default() below. Any failure — no network, bad file, empty
+# cache — falls through to the fallback, so this can never brick a run.
+MODELS_URL = "https://dotheth.ing/models.txt"
+MODELS_CACHE = DTT_CACHE / "models.txt"
+MODELS_STAMP = DTT_CACHE / ".models_last_fetch"
+MODELS_TTL = 86400
+
+
+def _load_remote_models():
+    try:
+        DTT_CACHE.mkdir(parents=True, exist_ok=True)
+        stale = True
+        try:
+            stale = (time.time() - float(MODELS_STAMP.read_text().strip())) >= MODELS_TTL
+        except Exception:
+            pass
+        if stale:
+            # Stamp before the fetch: one attempt per day, even when it fails.
+            # A dead website must not add a hang to every startup.
+            MODELS_STAMP.write_text(str(time.time()))
+            try:
+                resp = requests.get(MODELS_URL, timeout=5)
+                if resp.ok and resp.text.strip():
+                    MODELS_CACHE.write_text(resp.text)
+            except Exception:
+                # Keep the previous cache; a failed fetch must not cost the
+                # defaults we already had.
+                pass
+        out = {}
+        for line in MODELS_CACHE.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            role, _, slug = line.partition("=")
+            if role.strip() and slug.strip():
+                out[role.strip().lower()] = slug.strip()
+        return out
+    except Exception:
+        return {}
+
+
+_REMOTE_MODELS = _load_remote_models()
+
+
+def _model_default(role, fallback):
+    return _REMOTE_MODELS.get(role) or fallback
+
+
 # Browser-agent (Notte) model. Overridable via DTT_MODEL_BROWSER or
 # --model browser=<slug>; the env var must be read here because the Notte
 # config below is written at import time, before CLI parsing.
-BROWSER_AGENT_MODEL_DEFAULT = "anthropic/claude-sonnet-4.6"
+BROWSER_AGENT_MODEL_DEFAULT = _model_default("browser", "anthropic/claude-sonnet-4.6")
 BROWSER_AGENT_MODEL = os.environ.get("DTT_MODEL_BROWSER") or BROWSER_AGENT_MODEL_DEFAULT
+# Cheap vision model for Notte's page perception.
+PERCEPTION_MODEL = _model_default("perception", "google/gemini-3.7-flash")
 
 
 def _write_notte_config(path=None):
@@ -617,7 +670,7 @@ def _write_notte_config(path=None):
         target.write_text(
             'browser_backend = "playwright"\n'
             f'reasoning_model = "openrouter/{BROWSER_AGENT_MODEL}"\n'
-            'perception_model = "openrouter/google/gemini-3.5-flash"\n'
+            f'perception_model = "openrouter/{PERCEPTION_MODEL}"\n'
             'timeout_default_ms = 15000\n'
             'timeout_action_ms = 20000\n',
             encoding="utf-8",
@@ -640,21 +693,21 @@ OPENROUTER_STATS= "https://openrouter.ai/api/v1/generation"
 # NB: no ":online" suffix. OpenRouter's web plugin errors out on large agentic
 # contexts (~60k+ tokens), returning an empty error that looks like "won't use
 # tools." The agent has native search_web/fetch_page tools, so it's redundant here.
-FABLE           = "anthropic/claude-fable-5"
+FABLE           = _model_default("main", "anthropic/claude-fable-5")
 # Quick mode's default. The -fast variant answers sooner but costs several
 # times more per token; quick mode only uses it when --fast is passed too.
-OPUS            = "anthropic/claude-opus-4.8"
-OPUS_FAST       = "anthropic/claude-opus-4.8-fast"
+OPUS            = _model_default("quick", "anthropic/claude-opus-4.8")
+OPUS_FAST       = _model_default("quick_fast", "anthropic/claude-opus-4.8-fast")
 # Secondary "worker" model: result-mode summarization, delegation, image/data
 # analysis, batch processing, and context compaction. The browser agent uses its
 # own model (see browser_agent) — this constant does not drive it.
-WORKER_DEFAULT  = "google/gemini-3.5-flash"
+WORKER_DEFAULT  = _model_default("worker", "google/gemini-3.7-flash")
 WORKER          = os.environ.get("DTT_MODEL_WORKER") or WORKER_DEFAULT
-ORACLE_DEFAULT  = "openai/gpt-5.6-sol:online"
-ORACLE_PRO      = "openai/gpt-5.6-sol-pro:online"
+ORACLE_DEFAULT  = _model_default("oracle", "openai/gpt-5.6-sol:online")
+ORACLE_PRO      = _model_default("oracle_pro", "openai/gpt-5.6-sol-pro:online")
 # Roles accepted by --model ROLE=SLUG and the DTT_MODEL_<ROLE> env vars:
 #   main    — the agent itself (default: Fable; Opus in quick mode; -fast with --fast)
-#   worker  — summarization, delegation, analysis, batch, compaction (default: Gemini 3.5 Flash)
+#   worker  — summarization, delegation, analysis, batch, compaction (default: Gemini 3.7 Flash)
 #   oracle  — second opinions (default: GPT-5.6 Sol; Sol Pro with --oraclepro)
 #   browser — the Notte browser agent (default: Sonnet 4.6)
 MODEL_ROLES     = ("main", "worker", "oracle", "browser")
@@ -3432,7 +3485,7 @@ async def post_completion(http, headers, payload, total_timeout, on_progress=Non
 
 
 # ═══════════════════════════════════════════════════════════════════
-# Smart Summarizer — pipes big outputs through Gemini 3.5 Flash
+# Smart Summarizer — pipes big outputs through the worker model
 # ═══════════════════════════════════════════════════════════════════
 async def smart_summarize(raw, goal, headers, cost_tracker, http, tool_name="unknown"):
     if not raw or not raw.strip():
@@ -3754,7 +3807,7 @@ class InputHandler:
 # ═══════════════════════════════════════════════════════════════════
 RESULT_MODE_PROP = {
     "type": "string",
-    "description": "Mandatory. 'raw' for exact unprocessed output, or a goal string for Gemini 3.5 Flash-summarized output.",
+    "description": "Mandatory. 'raw' for exact unprocessed output, or a goal string for worker-model-summarized output.",
 }
 
 # Injected into every tool schema (except finalize) after the TOOLS list below.
@@ -4185,7 +4238,7 @@ TOOLS = [
         "function": {
             "name": "delegate",
             "description": (
-                "Delegate a focused sub-task to a fast, cheap model (Gemini 3.5 Flash). Use for: "
+                "Delegate a focused sub-task to the fast, cheap worker model. Use for: "
                 "summarizing, extracting structured data, reformatting, translating, classifying, "
                 "deduplicating search results, extracting the most relevant items from a large "
                 "dataset. Use input_file to pass file contents as context. The delegate has NO "
@@ -4422,7 +4475,7 @@ TOOLS = [
         "function": {
             "name": "analyze_data",
             "description": (
-                "Send a file's contents to Gemini 3.5 Flash for structured processing. Use for "
+                "Send a file's contents to the worker model for structured processing. Use for "
                 "deduplication, extraction, filtering, classification, scoring, ranking, "
                 "reformatting, or any analytical task over a data file (JSON, CSV, text). "
                 "For files over 200K characters, content is chunked and processed in parts. "
@@ -4460,7 +4513,7 @@ TOOLS = [
             "name": "use_skill",
             "description": (
                 "Invoke a loaded skill by name. Skills are user-defined procedures loaded "
-                "from ~/.dtt/skills/. mode='delegate' runs the skill as an isolated Gemini 3.5 Flash "
+                "from ~/.dtt/skills/. mode='delegate' runs the skill as an isolated worker-model "
                 "sub-task. mode='read' returns the full skill instructions into your context "
                 "so you can execute them yourself with your tools. Skills marked as inline "
                 "in the system prompt are already active — follow their instructions directly."
@@ -4480,7 +4533,7 @@ TOOLS = [
                         "type": "string",
                         "enum": ["delegate", "read"],
                         "description": (
-                            "'delegate' runs the skill as an isolated sub-task via Gemini 3.5 Flash. "
+                            "'delegate' runs the skill as an isolated sub-task via the worker model. "
                             "'read' returns the full skill instructions into your context so "
                             "you can execute them yourself with your full tool access."
                         ),
@@ -4496,7 +4549,7 @@ TOOLS = [
         "function": {
             "name": "batch_process",
             "description": (
-                "Process a list of items in parallel using Gemini 3.5 Flash. Each item is "
+                "Process a list of items in parallel using the worker model. Each item is "
                 "processed independently with the same instruction template. Use for: bulk "
                 "research, classification, extraction, enrichment. Results are collected "
                 "into a JSON array and written to output_file.\n\n"
@@ -4504,7 +4557,7 @@ TOOLS = [
                 "SERPER_API_KEY is set, otherwise via SearXNG (using search_query_template "
                 "for targeted queries like '2026 current CEO {item}'). The top 20 results "
                 "then have their page content fetched via httpx + BeautifulSoup and truncated "
-                "to ~5000 tokens each, giving Gemini 3.5 Flash rich source material to work with.\n\n"
+                "to ~5000 tokens each, giving the worker model rich source material to work with.\n\n"
                 "For large datasets (500+ items), split into chunks and call batch_process "
                 "repeatedly (e.g. 30 calls of 50 items each). Repeated batch_process calls "
                 "in sequence is the correct and expected pattern.\n\n"
@@ -4520,7 +4573,7 @@ TOOLS = [
                     "instruction_template": {
                         "type": "string",
                         "description": (
-                            "Instruction sent to Gemini 3.5 Flash for each item. Use {item} as "
+                            "Instruction sent to the worker model for each item. Use {item} as "
                             "placeholder. Use {search_results} if enrich_with_search is true. "
                             "When enriched, search_results includes fetched page content from "
                             "up to 20 URLs (~5000 tokens each), not just snippets."
@@ -4952,7 +5005,7 @@ presented as research is a CATASTROPHIC failure
 
 ALWAYS:
 - Use run_code to write batch-processing scripts for parallel execution
-- Use batch_process to fan out work to Gemini 3.5 Flash in parallel
+- Use batch_process to fan out work to the worker model in parallel
 - Use analyze_data to process/filter/deduplicate large result files
 - Track completion counts explicitly: "Processed 347/500"
 - Write intermediate results to files in {cache_dir} after every batch — never \
@@ -5195,7 +5248,7 @@ requests — NOT for human-readable web pages (use fetch_page for those).
 Interprets charts, diagrams, screenshots, scanned documents.
 - notes_add/notes_read: accumulate key findings across a long task so you \
 don't lose them to context pressure. Use notes_add early and often.
-- delegate: cheap, fast sub-task execution via Gemini 3.5 Flash. Use for mechanical \
+- delegate: cheap, fast sub-task execution via the worker model. Use for mechanical \
 work: summarizing documents, extracting structured data, reformatting content, \
 classification. The delegate has NO tools — it only processes text you provide.
 - think: FREE. Use liberally before complex edits, after confusing results, \
@@ -5212,7 +5265,7 @@ handles that. Wastes tokens if misused. Use increasing intervals when polling.
 is automatically injected for direct SearXNG API access. Use asyncio + httpx for \
 parallel operations (e.g. 500 concurrent searches). Write results to files rather \
 than printing massive stdout. This is the tool for ANY bulk data work.
-- analyze_data: Send large files to Gemini 3.5 Flash for processing. Use for deduplication, \
+- analyze_data: Send large files to the worker model for processing. Use for deduplication, \
 ranking, extraction, classification of data files. Supports chunking for files \
 over 200K chars. Use output_file to write results directly to disk.
 - delegate: Now supports input_file parameter to pass file contents as context. \
@@ -5220,10 +5273,10 @@ Use for file-based text processing, extraction, reformatting. For very large fil
 prefer analyze_data which supports chunking.
 - use_skill: Invoke with mode='read' to load a skill's full instructions into \
 your context (you then execute the steps yourself with your tools). Use \
-mode='delegate' to run a text-processing skill as an isolated Gemini 3.5 Flash sub-task. \
+mode='delegate' to run a text-processing skill as an isolated worker-model sub-task. \
 Skills marked as inline in the system prompt are already active — follow their \
 instructions directly without invoking use_skill.
-- batch_process: THE tool for massive parallel workloads. Fans out to Gemini 3.5 Flash in \
+- batch_process: THE tool for massive parallel workloads. Fans out to the worker model in \
 parallel with up to 50 concurrent workers. For very large datasets (500+), split \
 into chunks and call batch_process repeatedly — this IS the correct pattern, not \
 a workaround. Use enrich_with_search=true with search_query_template for rich \
@@ -7097,7 +7150,7 @@ class Agent:
                 f"[System] Follow the above skill instructions step-by-step using your available tools."
             )
 
-        # mode == "delegate": Gemini 3.5 Flash shell-out
+        # mode == "delegate": worker-model shell-out
         skill_content = skill["content"]
         skill_model = fm.get("model", WORKER)
 
@@ -8732,7 +8785,7 @@ class Agent:
                                     "[System] WARNING: You appear to be manually grinding through "
                                     "items one-by-one using repeated search_web/fetch_page/http_request "
                                     "calls. This is inefficient. Switch to a batch approach:\n"
-                                    "- Use batch_process to fan out work to Gemini 3.5 Flash in parallel\n"
+                                    "- Use batch_process to fan out work to the worker model in parallel\n"
                                     "- Use run_code to write a parallel processing script\n"
                                     "- Use analyze_data to process large result files\n"
                                     "Note: Many sequential batch_process calls with different items "
@@ -8862,7 +8915,7 @@ class Agent:
             section += "\n<available_skills>\nCallable skills (invoke via use_skill tool):\n"
             for name, desc in callable_skills:
                 section += f"  - {name}: {desc}\n"
-            section += "Use mode='delegate' for isolated sub-task execution via Gemini 3.5 Flash, or mode='read' to load the full instructions into your own context.\n"
+            section += "Use mode='delegate' for isolated sub-task execution via the worker model, or mode='read' to load the full instructions into your own context.\n"
             section += "</available_skills>\n"
         return section
 

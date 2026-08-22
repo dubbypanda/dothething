@@ -2,7 +2,7 @@
 <meta charset="UTF-8" vid="2">
 <meta name="viewport" content="width=device-width, initial-scale=1.0" vid="3">
 <title vid="4">dothething (DTT) - The Autonomous AI Agent that Gets It Done</title>
-<meta name="description" content="An autonomous AI agent that runs locally, thinks for itself, and gets stuff done. Give it a task, walk away, come back to results. Powered by Claude Fable 5 with GPT-5.6 Sol oracle.">
+<meta name="description" content="An autonomous AI agent in a single local script. Give it a task, walk away, come back to results. Cheap and fast by default, top-tier models on demand.">
 
 <!-- Open Graph -->
 <meta property="og:type" content="website">
@@ -12,7 +12,7 @@
 <meta property="og:image" content="https://dotheth.ing/og_image.jpg">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
-<meta property="og:image:alt" content="dothething - autonomous AI agent powered by Claude Fable 5 with GPT-5.6 Sol oracle">
+<meta property="og:image:alt" content="dothething - a local autonomous AI agent that searches, browses, and codes on its own">
 <meta property="og:site_name" content="dothething">
 
 <!-- Twitter Card -->
@@ -20,7 +20,7 @@
 <meta name="twitter:title" content="dothething - The Autonomous AI Agent that Gets It Done">
 <meta name="twitter:description" content="An autonomous AI agent that runs locally, thinks for itself, and gets stuff done. Give it a task, walk away, come back to results.">
 <meta name="twitter:image" content="https://dotheth.ing/og_image.jpg">
-<meta name="twitter:image:alt" content="dothething - autonomous AI agent powered by Claude Fable 5 with GPT-5.6 Sol oracle">
+<meta name="twitter:image:alt" content="dothething - a local autonomous AI agent that searches, browses, and codes on its own">
 
 <!-- Structured Data -->
 <script type="application/ld+json">
@@ -63,7 +63,8 @@
         "File operations with fuzzy search/replace editing",
         "Shell command execution plus sandboxed Python/Bash/TypeScript",
         "Vision analysis via the worker model",
-        "GPT-5.6 Sol oracle for second opinions",
+        "Three model tiers (normal, advanced, quick) with daily-updated defaults",
+        "Oracle for a second opinion from a stronger model",
         "Thread persistence and resume",
         "Live cost tracking per model",
         "Context window management via result_mode summarization",
@@ -577,8 +578,8 @@
                     <div class="visual-col" vid="39">
                         <div class="visual-meta" vid="40">
                             Main Agent<br vid="41">
-                            <strong vid="42">Claude Fable 5</strong>
-                            executes core logic and tools
+                            <strong vid="42">Cheap by default</strong>
+                            top-tier models with --advanced
                         </div>
                         <div class="orb-stack" vid="43">
                             <div class="orb" vid="44">
@@ -605,8 +606,8 @@
                     <div class="visual-col" vid="56">
                         <div class="visual-meta" vid="57">
                             Oracle<br vid="58">
-                            <strong vid="59">GPT-5.6 Sol</strong>
-                            consulted for complex reasoning
+                            <strong vid="59">GPT-5.6</strong>
+                            a stronger second opinion when stuck
                         </div>
                         <div class="orb-stack" vid="60">
                             <div class="orb" vid="61">
@@ -666,7 +667,7 @@
                             <li><strong>Workflow Architecture</strong>
                             Describe task in plain language → agent drafts numbered plan → executes autonomously → searches web, reads/writes files, runs shell commands → delivers final output.</li>
                             <li><strong>Result Mode</strong>
-                            Every tool call includes a <code>result_mode</code>. "raw" delivers exact output; "goal" string pipes output through a cheaper worker model (Gemini 3.7 Flash) for focused summary, preserving context window.</li>
+                            Every tool call includes a <code>result_mode</code>. "raw" delivers exact output; "goal" string pipes output through a cheaper worker model (Gemini Flash) for focused summary, preserving context window.</li>
                             <li><strong>Stacked Tool Calls</strong>
                             Many tool calls per reply, all parallel by default. An optional <code>exec_order</code> field sequences them into stages: calls sharing a number run together, and the next stage waits for the previous one to finish. "Make a directory, write three files into it, list it" is one round-trip instead of three. If a whole stage fails, everything after it is skipped.</li>
                             <li><strong>Browser Automation</strong>
@@ -681,8 +682,10 @@
                     </div>
                     <div class="col-6">
                         <ul class="feature-list">
-                            <li><strong>Quick Mode</strong>
-                            <code>dtt q "what's the weather in Cape Town"</code> for small tasks. Runs Opus 4.8 with a trimmed toolset (no oracle, no planning bookkeeping) and aims to finish in two turns: one reply carrying every tool call the job needs, staged with <code>exec_order</code>, then the answer. Loop cap drops to 15. Add <code>--fast</code> for Opus 4.8-fast.</li>
+                            <li><strong>Three Modes</strong>
+                            Normal is the default: cheap, fast models at high reasoning, full toolset. <code>--advanced</code> swaps in the strongest models (Claude Fable 5, a GPT-5.6 Sol oracle) at max reasoning for hard tasks. <code>dtt q "..."</code> is quick mode: a one-shot on a fast frontier model, no oracle, trimmed toolset, done in about two turns.</li>
+                            <li><strong>Model Defaults, Live</strong>
+                            The model for each role is read from <code>dotheth.ing/models.txt</code>, fetched once a day. Defaults change without a new release. Override any role per run with <code>--model role=slug</code> or the <code>DTT_MODEL_*</code> env vars.</li>
                             <li><strong>Thread Persistence</strong>
                             Sessions save to <code>~/.dtt/threads/</code> with timestamped IDs. Pick up where you left off with <code>--resume &lt;id&gt;</code>. Full cost breakdown prints on exit: tokens, cache hits, dollars.</li>
                             <li><strong>Prompt Caching</strong>
@@ -727,7 +730,7 @@
                     </div>
                     <div class="tool-item">
                         <span class="tool-name">oracle</span>
-                        <div class="tool-desc">oracle, think. GPT-5.6 Sol second opinion + free reasoning scratchpad.</div>
+                        <div class="tool-desc">oracle, think. A stronger model for a second opinion, plus a free reasoning scratchpad.</div>
                     </div>
                     <div class="tool-item">
                         <span class="tool-name">notes</span>
@@ -769,6 +772,10 @@
                         <span class="tool-name">email</span>
                         <div class="tool-desc">email_auth, email_list_inboxes, email_create_inbox, email_list, email_read, email_send, email_delete</div>
                     </div>
+                    <div class="tool-item">
+                        <span class="tool-name">browsermcp</span>
+                        <div class="tool-desc">--browsermcp serves dtt_search, dtt_fetch, dtt_browser, dtt_browser_agent to other agents over stdio MCP.</div>
+                    </div>
                 </div>
             </div>
 
@@ -777,9 +784,8 @@
                 <table class="data-table" vid="145">
                     <tbody vid="146">
                         <tr vid="147"><td class="col-key" vid="148">--prompt</td><td class="col-val" vid="149">Initial task description.</td></tr>
-                        <tr><td class="col-key">q / --quick</td><td class="col-val">Quick mode: one-shot on Opus 4.8, stacked tool calls, no oracle.</td></tr>
-                        <tr vid="150"><td class="col-key" vid="151">--fast</td><td class="col-val" vid="152">Swaps to Opus 4.8-fast.</td></tr>
-                        <tr vid="153"><td class="col-key" vid="154">--oraclepro</td><td class="col-val" vid="155">Upgrades oracle to GPT-5.6 Sol Pro.</td></tr>
+                        <tr><td class="col-key">q / --quick</td><td class="col-val">Quick mode: one-shot on a fast frontier model, stacked tool calls, no oracle.</td></tr>
+                        <tr><td class="col-key">--advanced</td><td class="col-val">Advanced mode: strongest models at max reasoning, for hard tasks.</td></tr>
                         <tr><td class="col-key">--model ROLE=SLUG</td><td class="col-val">Override any model role: main, worker, oracle, browser. Repeatable; also via DTT_MODEL_* env vars.</td></tr>
                         <tr vid="156"><td class="col-key" vid="157">--cwd DIR</td><td class="col-val" vid="158">Set working directory.</td></tr>
                         <tr vid="159"><td class="col-key" vid="160">--resume ID</td><td class="col-val" vid="161">Load thread from ~/.dtt/threads/</td></tr>
@@ -796,6 +802,7 @@
                         <tr><td class="col-key">--max-cost USD</td><td class="col-val">Stop and checkpoint at this cumulative cost.</td></tr>
                         <tr><td class="col-key">--version / -V</td><td class="col-val">Print version and exit.</td></tr>
                         <tr><td class="col-key">--update</td><td class="col-val">Force an update check (bypasses 6-hour rate limit).</td></tr>
+                        <tr><td class="col-key">--browsermcp</td><td class="col-val">Serve dtt's search + browser tools to another agent over stdio MCP.</td></tr>
                         <tr><td class="col-key">--keep-temp</td><td class="col-val">Keep /tmp/dothething on exit.</td></tr>
                     </tbody>
                 </table>

@@ -20,7 +20,7 @@ You describe a task in plain English. The agent breaks it down, picks the right 
 - Sends and receives email through its own inbox via AgentMail
 - Copies to and pastes from your system clipboard, including images
 - Accepts mid-task input. Press any key while it's working to type instructions. Ctrl-Q queues input for after the current step finishes
-- Farms out grunt work to a cheaper model. Asks GPT-5.6 Sol for a second opinion when stuck
+- Farms out grunt work to a cheaper model, and asks a stronger one for a second opinion when it's stuck
 - Saves full conversation threads so you can resume interrupted work
 - Tracks token usage and dollar cost via OpenRouter, with Anthropic prompt caching for cost reduction
 
@@ -41,7 +41,7 @@ Omit `--prompt` to open a multiline editor. Type your task, then hit Esc+Enter t
 
 ## Modes
 
-dtt has three modes. **Normal** is the default: cheap, fast models (DeepSeek V4 Flash for the agent, Gemini Flash for the worker and browser, GPT-5.6 Terra for the oracle) at `xhigh` reasoning, with the full toolset. It handles most work.
+dtt has three modes. **Normal** is the default: cheap, fast models (DeepSeek V4 Flash for the agent, Gemini Flash for the worker, Claude Sonnet for the browser, GPT-5.6 Terra for the oracle) at `xhigh` reasoning, with the full toolset. It handles most work.
 
 ```bash
 dtt "research the 10 largest data breaches of 2025 and summarise the causes"
@@ -101,7 +101,7 @@ Everything else is installed automatically into `/tmp/dothething` on first run.
 
 ## How it works
 
-The agent routes Claude Fable through OpenRouter. Every turn, the model decides which tools to call, processes the results, and decides what to do next.
+Every model call routes through OpenRouter. Each turn, the agent decides which tools to call, reads the results, and decides what to do next. It keeps going until the task is done or it hits the loop or cost limit.
 
 **result_mode.** Every tool call has a `result_mode`. If you need exact output, use `"raw"`. If you tell it to "extract all function signatures", it pipes the output through the worker model for a tight summary before the main agent sees it. This keeps the context window manageable on long tasks.
 
@@ -181,13 +181,13 @@ The main agent's reasoning effort tracks the mode: normal runs `xhigh`, advanced
 Any of the four roles can be swapped for a different OpenRouter model with `--model`:
 
 ```bash
-dtt --model oracle=x-ai/grok-5 --prompt "..."                # different oracle
-dtt --model worker=google/gemini-3.5-flash-lite "..."        # cheaper worker
-dtt --model anthropic/claude-sonnet-4.6 "..."                # bare slug targets main
-dtt --model main=openai/gpt-5.6-sol --model oracle=anthropic/claude-fable-5 "..."
+dtt --model oracle=x-ai/grok-5 "..."                         # different oracle
+dtt --model worker=google/gemini-flash-lite-latest "..."     # cheaper worker
+dtt --model anthropic/claude-opus-5 "..."                    # bare slug targets main
+dtt --model main=openai/gpt-5.6-sol --model browser=~anthropic/claude-sonnet-latest "..."
 ```
 
-`--model` beats the `q`/`--fast`/`--oraclepro` defaults. A resumed thread keeps its overrides unless you pass new ones, and `--model oracle=default` clears one. To make an override permanent, set `DTT_MODEL_MAIN`, `DTT_MODEL_WORKER`, `DTT_MODEL_ORACLE`, or `DTT_MODEL_BROWSER` in `~/.dtt/env`; CLI flags win over env vars. Orchestrator workers inherit whatever overrides are in effect.
+`--model` beats the mode defaults. A resumed thread keeps its overrides unless you pass new ones, and `--model oracle=default` clears one. To make an override permanent, set `DTT_MODEL_MAIN`, `DTT_MODEL_WORKER`, `DTT_MODEL_ORACLE`, or `DTT_MODEL_BROWSER` in `~/.dtt/env`; CLI flags win over env vars. Orchestrator workers inherit whatever overrides are in effect.
 
 ## Tools
 

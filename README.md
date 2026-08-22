@@ -166,7 +166,7 @@ All calls route through OpenRouter. You only need one API key. The default slugs
 |---|---|---|
 | Main agent (`main`) | DeepSeek V4 Flash | Claude Fable 5 |
 | Worker: summaries, analysis, delegation (`worker`) | Gemini Flash | Gemini Flash |
-| Browser agent, Notte (`browser`) | Gemini Flash | Gemini Flash |
+| Browser agent, Notte (`browser`) | Claude Sonnet | Claude Fable 5 |
 | Oracle (`oracle`) | GPT-5.6 Terra | GPT-5.6 Sol |
 | Perception (Notte vision) | Gemini Flash | Gemini Flash |
 

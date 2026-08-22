@@ -704,7 +704,7 @@ def _model_default(role, fallback):
 # These globals hold the NORMAL tier at import time (the Notte config below is
 # written before CLI parsing); main() repoints them to the advanced tier when
 # --advanced is passed, then rewrites the config.
-BROWSER_AGENT_MODEL_DEFAULT = _model_default("browser", "~google/gemini-flash-latest")
+BROWSER_AGENT_MODEL_DEFAULT = _model_default("browser", "~anthropic/claude-sonnet-latest")
 BROWSER_AGENT_MODEL = os.environ.get("DTT_MODEL_BROWSER") or BROWSER_AGENT_MODEL_DEFAULT
 # Cheap vision model for Notte's page perception.
 PERCEPTION_MODEL = _model_default("perception", "~google/gemini-flash-latest")
@@ -755,7 +755,7 @@ NORMAL_WORKER   = _model_default("worker", "~google/gemini-flash-latest")
 ADVANCED_MAIN   = _model_default("advanced_main", "~anthropic/claude-fable-latest")
 ADVANCED_ORACLE = _model_default("advanced_oracle", "openai/gpt-5.6-sol")
 ADVANCED_WORKER = _model_default("advanced_worker", NORMAL_WORKER)
-ADVANCED_BROWSER = _model_default("advanced_browser", BROWSER_AGENT_MODEL_DEFAULT)
+ADVANCED_BROWSER = _model_default("advanced_browser", "~anthropic/claude-fable-latest")
 ADVANCED_PERCEPTION = _model_default("advanced_perception", PERCEPTION_MODEL)
 # Quick mode's model: one fast frontier model, one-shot, no oracle.
 QUICK_MODEL     = _model_default("quick", "anthropic/claude-opus-5-fast")

@@ -39,16 +39,26 @@ The first run also takes a couple of minutes to set up a Python venv, install Se
 
 Omit `--prompt` to open a multiline editor. Type your task, then hit Esc+Enter to submit.
 
-## Quick mode
+## Modes
 
-For small tasks where you want an answer in seconds, not a research project, put `q` in front of your prompt:
+dtt has three modes. **Normal** is the default: cheap, fast models (DeepSeek V4 Flash for the agent, Gemini Flash for the worker and browser, GPT-5.6 Terra for the oracle) at `xhigh` reasoning, with the full toolset. It handles most work.
+
+```bash
+dtt "research the 10 largest data breaches of 2025 and summarise the causes"
+```
+
+**Advanced** (`--advanced`) swaps in the strongest models (Claude Fable 5 plus the GPT-5.6 Sol oracle) at `max` reasoning. Reach for it on genuinely hard tasks; it is slower and costs more.
+
+```bash
+dtt --advanced "audit this codebase for concurrency bugs and propose fixes"
+```
+
+**Quick** (`q`, or `-q`/`--quick`) is for a fast answer, not a research project. It one-shots on a fast frontier model (Claude Opus 5 Fast), with a trimmed toolset: no oracle, no plan or notes bookkeeping, no batch machinery, and skills stay out of the prompt until invoked. Its first reply stacks every tool call the job needs, staged with `exec_order` where order matters, and the next reply is the answer. The loop cap drops to 15 turns.
 
 ```bash
 dtt q "what's the weather like in Cape Town today"
 dtt q "create an SSH key for me and copy it to clipboard"
 ```
-
-Quick mode runs on Opus 4.8 at reduced reasoning effort, with a trimmed toolset: no oracle, no plan or notes bookkeeping, no batch machinery, and skills stay out of the prompt until invoked. The prompt pushes it to one-shot the task. Its first reply stacks every tool call the job needs, staged with `exec_order` where order matters, and the next reply is the answer. The loop cap drops to 15 turns. `-q` and `--quick` do the same thing as the `q` prefix. Add `--fast` if you want Opus 4.8-fast for quicker output; it costs quite a bit more per token.
 
 ## Requirements
 
@@ -69,12 +79,11 @@ Everything else is installed automatically into `/tmp/dothething` on first run.
 
 | Flag | What it does |
 |---|---|
-| `q` (or `-q`, `--quick`) | Quick mode: one-shot the task on Opus 4.8 with a trimmed toolset and no oracle. Add `--fast` for Opus 4.8-fast |
+| `q` (or `-q`, `--quick`) | Quick mode: one-shot on a fast frontier model with a trimmed toolset and no oracle |
+| `--advanced` | Advanced mode: strongest models (Fable + GPT-5.6 Sol) at max reasoning, for hard tasks |
 | `--prompt "..."` | Provide the task inline instead of opening the editor |
-| `--fast` | Use claude-opus-4.8-fast:online (cheaper, slightly less capable) |
 | `--cwd DIR` | Set the working directory for file operations (default: `.`) |
 | `--max-loops N` | Cap the number of agent turns (default: 200; 15 in quick mode) |
-| `--oraclepro` | Use GPT-5.6 Sol Pro instead of GPT-5.6 Sol for oracle calls |
 | `--model [ROLE=]SLUG` | Override the model for a role: `main`, `worker`, `oracle`, or `browser`. Repeatable. A bare slug targets `main`; `ROLE=default` clears a saved or env override |
 | `--resume ID` | Pick up a previous session by thread ID. Inherits that thread's saved config (model, oracle, `--max-loops`, `--cwd`); pass a flag to override it |
 | `--headed` | Show the browser window for visual debugging |
@@ -88,6 +97,7 @@ Everything else is installed automatically into `/tmp/dothething` on first run.
 | `--debug` | Log raw API payloads and cache metrics |
 | `--install` | Install the script to `~/.local/bin/dtt`, adding that directory to your PATH if needed |
 | `--update` | Force an update check, bypassing the 6-hour rate limit |
+| `--browsermcp` | Run a stdio MCP server exposing dtt's search + browser tools to another agent |
 
 ## How it works
 
@@ -152,16 +162,19 @@ Set `AGENTMAIL_API_KEY` in your shell or let the agent create one via `email_aut
 
 All calls route through OpenRouter. You only need one API key. The default slugs live in [models.txt](https://dotheth.ing/models.txt); dtt fetches that file once a day, so defaults can change without a release. Your `--model` flags and `DTT_MODEL_*` env vars always win over it.
 
-| Role | Default model | Flag to change |
+| Role | Normal (default) | Advanced (`--advanced`) |
 |---|---|---|
-| Main agent (`main`) | Claude Fable 5 | `--fast` for Opus 4.8-fast; quick mode (`q`) uses Opus 4.8, or Opus 4.8-fast with `--fast` |
-| Summarizer, analysis, delegate (`worker`) | Google Gemini 3.7 Flash | `--model worker=...` |
-| Browser agent, Notte (`browser`) | Claude Sonnet 4.6 | `--model browser=...` |
-| Oracle (`oracle`) | GPT-5.6 Sol | `--oraclepro` for GPT-5.6 Sol Pro (not exposed in quick mode) |
+| Main agent (`main`) | DeepSeek V4 Flash | Claude Fable 5 |
+| Worker: summaries, analysis, delegation (`worker`) | Gemini Flash | Gemini Flash |
+| Browser agent, Notte (`browser`) | Gemini Flash | Gemini Flash |
+| Oracle (`oracle`) | GPT-5.6 Terra | GPT-5.6 Sol |
+| Perception (Notte vision) | Gemini Flash | Gemini Flash |
+
+Quick mode (`q`) runs the agent on Claude Opus 5 Fast with no oracle. Any role is overridable with `--model role=slug` or `DTT_MODEL_*`.
 
 ### Reasoning effort
 
-The main agent runs at `xhigh`. The oracle runs at `max`, the top of OpenRouter's scale, on the grounds that it only gets called on the problems the agent is already stuck on, so the extra thinking is cheap at that call volume. Quick mode drops the main agent to `medium`, which is most of where its speed comes from.
+The main agent's reasoning effort tracks the mode: normal runs `xhigh`, advanced runs `max` (the top of OpenRouter's scale), and quick drops to `medium`, which is most of where its speed comes from. The oracle always runs `max`: it is only called on problems the agent is already stuck on, so the extra thinking is cheap at that call volume.
 
 ### Model overrides
 

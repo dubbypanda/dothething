@@ -1,12 +1,21 @@
 # dothething model defaults.
 # dtt fetches this file from dotheth.ing/models.txt once a day and caches it.
 # Precedence: --model flags > DTT_MODEL_* env vars > this file > baked-in defaults.
+# A leading ~ pins to OpenRouter's "latest" alias for that family.
 # Format: role=openrouter-slug. Unknown roles are ignored.
-main=anthropic/claude-fable-5
-quick=anthropic/claude-opus-4.8
-quick_fast=anthropic/claude-opus-4.8-fast
-worker=google/gemini-3.7-flash
-oracle=openai/gpt-5.6-sol:online
-oracle_pro=openai/gpt-5.6-sol-pro:online
-browser=anthropic/claude-sonnet-4.6
-perception=google/gemini-3.7-flash
+#
+# Two tiers. "normal" is the default (cheap, fast, xhigh reasoning). "advanced"
+# (dtt --advanced) swaps in the advanced_* slugs and max reasoning; any advanced_
+# role left unset falls back to its normal counterpart. Quick mode (dtt q "...")
+# uses the quick slug, drops the oracle, and one-shots the task.
+main=~deepseek/deepseek-v4-flash-latest
+quick=anthropic/claude-opus-5-fast
+worker=~google/gemini-flash-latest
+oracle=openai/gpt-5.6-terra
+browser=~google/gemini-flash-latest
+perception=~google/gemini-flash-latest
+advanced_main=~anthropic/claude-fable-latest
+advanced_oracle=openai/gpt-5.6-sol
+advanced_worker=~google/gemini-flash-latest
+advanced_browser=~google/gemini-flash-latest
+advanced_perception=~google/gemini-flash-latest

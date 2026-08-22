@@ -151,11 +151,18 @@ dtt_install() {
 KEEP_TEMP=false
 FORCE_UPDATE=false
 DO_INSTALL=false
+BROWSER_MCP=false
 PASS_ARGS=()
 for arg in "$@"; do
   case "$arg" in
     --keep-temp)
       KEEP_TEMP=true
+      ;;
+    --browsermcp)
+      # stdio MCP server: stdout is the JSON-RPC channel, so no preamble/setup
+      # noise may touch it. Handled at the python exec below.
+      BROWSER_MCP=true
+      PASS_ARGS+=("$arg")
       ;;
     --headed|--orchestrator|--pipe|--notify-desktop|--tui)
       PASS_ARGS+=("$arg")
@@ -178,9 +185,8 @@ for arg in "$@"; do
 dothething — autonomous AI agent | https://dotheth.ing
 
 Usage:
-  ./dtt.sh [q] [--fast] [--prompt "..."] [--cwd DIR] [--max-loops N]
-           [--oraclepro] [--model [ROLE=]SLUG]
-           [--headed] [--orchestrator]
+  ./dtt.sh [q] [--advanced] [--prompt "..."] [--cwd DIR] [--max-loops N]
+           [--model [ROLE=]SLUG] [--headed] [--orchestrator]
            [--verbose] [--debug] [--keep-temp] [--resume THREAD_ID]
            [--version] [--update] [--install] [--pipe] [--tui]
            [--notify-desktop] [--notify-email EMAIL] [--max-cost USD]
@@ -191,31 +197,34 @@ Install:
                   Everything else (venv, SearXNG, Notte) installs itself on
                   first run. Already have the file? ./dtt.sh --install
 
-Quick mode:
-  ./dtt.sh q "what's the weather like in Cape Town today"
-  ./dtt.sh q "create an SSH key for me and copy it to clipboard"
-                  One-shots the task on Opus 4.8: stacked/staged tool calls,
-                  no oracle, as few turns as possible. Also available as
-                  -q/--quick. Add --fast for Opus 4.8-fast (quicker output,
-                  costs more). Default loop cap drops to 15.
+Modes:
+  (default)       Normal tier: cheap, fast models at xhigh reasoning. The
+                  everyday default; full toolset and oracle.
+  --advanced      Advanced tier: the strongest models (Fable + GPT-5.6 Sol
+                  oracle) at max reasoning. For hard tasks; slower, costlier.
+  q / --quick     Quick mode: one-shot on a fast frontier model, stacked/
+                  staged tool calls, no oracle, as few turns as possible.
+                  Loop cap drops to 15. E.g. dtt q "weather in Cape Town".
+
+Model defaults come from dotheth.ing/models.txt (fetched daily), falling back
+to baked-in slugs. --model and DTT_MODEL_* env vars override per role.
 
 Flags:
-  --fast          Use anthropic/claude-opus-4.8-fast:online instead of fable 5
   -q, --quick     Quick mode (see above)
+  --advanced      Advanced mode (see above)
   --prompt "..."  Provide task inline (otherwise opens multiline editor)
   --cwd DIR       Working directory for relative paths (default: .)
   --max-loops N   Maximum agent loop iterations (default: 200)
-  --oraclepro     Use openai/gpt-5.6-sol-pro for oracle (default: openai/gpt-5.6-sol)
   --model [ROLE=]SLUG
                   Override the model for one role; repeat for several. Roles:
                   main (the agent), worker (summaries/delegation/batch),
                   oracle (second opinions), browser (Notte browser agent).
                   A bare slug targets main. ROLE=default clears a saved or
-                  env override. Wins over q/--fast/--oraclepro. Persists
+                  env override. Wins over the q/--advanced defaults. Persists
                   across --resume. Env equivalents: DTT_MODEL_MAIN,
                   DTT_MODEL_WORKER, DTT_MODEL_ORACLE, DTT_MODEL_BROWSER
                   (put them in ~/.dtt/env to make an override permanent).
-                  Example: --model oracle=x-ai/grok-5 --model worker=google/gemini-3.5-flash-lite
+                  Example: --model oracle=x-ai/grok-5 --model worker=google/gemini-flash-latest
   --resume ID     Resume a previous thread by ID (from ~/.dtt/threads/).
                   Combine with --prompt or positional text, or just let the
                   editor open, to supply fresh instructions on resume.
@@ -266,6 +275,13 @@ HELP
       ;;
   esac
 done
+
+# In MCP-server mode, fd1 is the JSON-RPC channel. Save it to fd3 and point the
+# preamble's stdout at stderr so nothing but protocol reaches the client; the
+# python exec below restores fd1 from fd3.
+if [ "$BROWSER_MCP" = true ]; then
+  exec 3>&1 1>&2
+fi
 
 if [ "$DO_INSTALL" = true ]; then
     dtt_install
@@ -682,13 +698,17 @@ def _model_default(role, fallback):
     return _REMOTE_MODELS.get(role) or fallback
 
 
-# Browser-agent (Notte) model. Overridable via DTT_MODEL_BROWSER or
-# --model browser=<slug>; the env var must be read here because the Notte
-# config below is written at import time, before CLI parsing.
-BROWSER_AGENT_MODEL_DEFAULT = _model_default("browser", "anthropic/claude-sonnet-4.6")
+# Two model tiers. "normal" is the default: cheap, fast, xhigh reasoning.
+# "advanced" (dtt --advanced) swaps in the advanced_* slugs and max reasoning;
+# an advanced_* role left unset in models.txt falls back to its normal value.
+# These globals hold the NORMAL tier at import time (the Notte config below is
+# written before CLI parsing); main() repoints them to the advanced tier when
+# --advanced is passed, then rewrites the config.
+BROWSER_AGENT_MODEL_DEFAULT = _model_default("browser", "~google/gemini-flash-latest")
 BROWSER_AGENT_MODEL = os.environ.get("DTT_MODEL_BROWSER") or BROWSER_AGENT_MODEL_DEFAULT
 # Cheap vision model for Notte's page perception.
-PERCEPTION_MODEL = _model_default("perception", "google/gemini-3.7-flash")
+PERCEPTION_MODEL = _model_default("perception", "~google/gemini-flash-latest")
+_PERCEPTION_AT_IMPORT = PERCEPTION_MODEL  # to detect an advanced-tier change in main()
 
 
 def _write_notte_config(path=None):
@@ -723,26 +743,32 @@ if "NOTTE_CONFIG_PATH" not in os.environ:
 
 OPENROUTER_URL  = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_STATS= "https://openrouter.ai/api/v1/generation"
-# NB: no ":online" suffix. OpenRouter's web plugin errors out on large agentic
-# contexts (~60k+ tokens), returning an empty error that looks like "won't use
-# tools." The agent has native search_web/fetch_page tools, so it's redundant here.
-FABLE           = _model_default("main", "anthropic/claude-fable-5")
-# Quick mode's default. The -fast variant answers sooner but costs several
-# times more per token; quick mode only uses it when --fast is passed too.
-OPUS            = _model_default("quick", "anthropic/claude-opus-4.8")
-OPUS_FAST       = _model_default("quick_fast", "anthropic/claude-opus-4.8-fast")
-# Secondary "worker" model: result-mode summarization, delegation, image/data
-# analysis, batch processing, and context compaction. The browser agent uses its
-# own model (see browser_agent) — this constant does not drive it.
-WORKER_DEFAULT  = _model_default("worker", "google/gemini-3.7-flash")
+# No ":online" suffix anywhere. It attaches OpenRouter's web plugin, but dtt
+# has its own SearXNG + Notte tools and we want all web access to go through
+# them; the plugin also errors out on large agentic contexts.
+
+# Normal tier (default).
+NORMAL_MAIN     = _model_default("main", "~deepseek/deepseek-v4-flash-latest")
+NORMAL_ORACLE   = _model_default("oracle", "openai/gpt-5.6-terra")
+NORMAL_WORKER   = _model_default("worker", "~google/gemini-flash-latest")
+# Advanced tier (dtt --advanced): each falls back to its normal value.
+ADVANCED_MAIN   = _model_default("advanced_main", "~anthropic/claude-fable-latest")
+ADVANCED_ORACLE = _model_default("advanced_oracle", "openai/gpt-5.6-sol")
+ADVANCED_WORKER = _model_default("advanced_worker", NORMAL_WORKER)
+ADVANCED_BROWSER = _model_default("advanced_browser", BROWSER_AGENT_MODEL_DEFAULT)
+ADVANCED_PERCEPTION = _model_default("advanced_perception", PERCEPTION_MODEL)
+# Quick mode's model: one fast frontier model, one-shot, no oracle.
+QUICK_MODEL     = _model_default("quick", "anthropic/claude-opus-5-fast")
+
+# Live "worker" model (result-mode summaries, delegation, analysis, batch,
+# compaction). Repointed to ADVANCED_WORKER by main() under --advanced.
+WORKER_DEFAULT  = NORMAL_WORKER
 WORKER          = os.environ.get("DTT_MODEL_WORKER") or WORKER_DEFAULT
-ORACLE_DEFAULT  = _model_default("oracle", "openai/gpt-5.6-sol:online")
-ORACLE_PRO      = _model_default("oracle_pro", "openai/gpt-5.6-sol-pro:online")
 # Roles accepted by --model ROLE=SLUG and the DTT_MODEL_<ROLE> env vars:
-#   main    — the agent itself (default: Fable; Opus in quick mode; -fast with --fast)
-#   worker  — summarization, delegation, analysis, batch, compaction (default: Gemini 3.7 Flash)
-#   oracle  — second opinions (default: GPT-5.6 Sol; Sol Pro with --oraclepro)
-#   browser — the Notte browser agent (default: Sonnet 4.6)
+#   main    — the agent (normal: DeepSeek V4 Flash; advanced: Fable; quick: Opus 5 Fast)
+#   worker  — summarization, delegation, analysis, batch, compaction (Gemini Flash)
+#   oracle  — second opinions (normal: GPT-5.6 Terra; advanced: GPT-5.6 Sol)
+#   browser — the Notte browser agent (Gemini Flash)
 MODEL_ROLES     = ("main", "worker", "oracle", "browser")
 MAX_LOOPS       = 200
 # Quick mode aims to one-shot in 2-3 turns; the cap is a safety net for error
@@ -2359,6 +2385,58 @@ class Browser:
                 }
             finally:
                 await self._save_cookies(session)
+
+    async def act(self, action, **params):
+        """Granular step against the persistent session, for the browser MCP.
+
+        Thin wrapper over Notte's own execute/observe/scrape so a calling agent
+        can drive a real browser step by step. Returns a dict; callers serialise
+        it. `observe` returns the interactable element map (ids to act on).
+        """
+        session = await self._ensure()
+        await self._load_cookies(session)
+        try:
+            if action == "observe":
+                obs = await session.aobserve()
+                els = []
+                space = getattr(obs, "space", None)
+                for a in (getattr(space, "interaction_actions", None) or []):
+                    els.append({
+                        "id": getattr(a, "id", None),
+                        "description": getattr(a, "description", "") or "",
+                        "type": type(a).__name__,
+                    })
+                page = session.window.page if session.window else None
+                return {"url": getattr(page, "url", ""),
+                        "title": (await page.title()) if page else "",
+                        "elements": els[:200], "element_count": len(els)}
+
+            if action == "scrape":
+                md = await session.ascrape(only_main_content=params.get("only_main_content", True))
+                page = session.window.page if session.window else None
+                return {"url": getattr(page, "url", ""), "markdown": (md or "")[:50000]}
+
+            if action == "screenshot":
+                out_dir = params.get("dir") or str(BASE / "screenshots")
+                Path(out_dir).mkdir(parents=True, exist_ok=True)
+                path = str(Path(out_dir) / f"browser_{int(time.time()*1000)}.png")
+                data = await session.window.page.screenshot(full_page=params.get("full_page", False))
+                Path(path).write_bytes(data)
+                return {"screenshot": path}
+
+            # Everything else maps to a Notte execute action. Notte validates
+            # the type and params and returns a result with .success/.message.
+            exec_kwargs = {"type": action}
+            exec_kwargs.update({k: v for k, v in params.items() if v is not None})
+            result = await session.aexecute(**exec_kwargs)
+            page = session.window.page if session.window else None
+            return {
+                "success": bool(getattr(result, "success", True)),
+                "message": getattr(result, "message", "") or "",
+                "url": getattr(page, "url", "") if page else "",
+            }
+        finally:
+            await self._save_cookies(session)
 
     async def close(self):
         async with self._lock:
@@ -4409,7 +4487,7 @@ TOOLS = [
         "function": {
             "name": "oracle",
             "description": (
-                "Consult GPT-5.6 Sol (or Sol Pro with --oraclepro) for a second opinion or validation. "
+                "Consult the oracle (a strong second model) for a second opinion or validation. "
                 "Inexpensive — use freely for: validating plans against the original request, confirming "
                 "analyses, resolving ambiguity, pre-finalize completeness checks. Set include_context=true "
                 "to send the full conversation history — especially recommended before finalize on complex "
@@ -5869,26 +5947,28 @@ class Agent:
         "shell_session":       "_tool_shell_session",
     }
 
-    def __init__(self, model, oracle_model, api_key, cwd, debug=False, verbose=False, headed=False, quick=False):
+    def __init__(self, model, oracle_model, api_key, cwd, debug=False, verbose=False, headed=False, mode="normal"):
         self.model = model
         self.oracle_model = oracle_model
         self._ctx_tokens = 0  # last model-call prompt_tokens, for the context-depth meter
-        self.quick = quick
+        # One of "quick" | "normal" | "advanced". quick stays a convenience
+        # flag because a lot of existing code keys off it (lean toolset, prompt,
+        # loop cap, meta).
+        self.mode = mode
+        self.quick = (mode == "quick")
         # Effective per-role model overrides (set by run_agent; persisted in
         # thread meta so --resume reproduces them).
         self._model_overrides = {}
         # Quick mode exposes a lean toolset (see QUICK_EXCLUDED_TOOLS).
-        self._tools = QUICK_TOOLS if quick else TOOLS
+        self._tools = QUICK_TOOLS if self.quick else TOOLS
         self._show_full = False  # --show-full: stream thinking live + show untruncated tool calls
         # OpenRouter's reasoning.effort enum tops out at "max", one rung above
-        # "xhigh" (none/minimal/low/medium/high/xhigh/max). The oracle is called
-        # sparingly, on the problems the main agent is already stuck on, so it
-        # gets "max" — at that call volume the extra thinking is cheap. The main
-        # agent runs every turn, where the same setting would cost far more in
-        # latency than it buys back, so it sits at "xhigh". Quick mode trades
-        # depth for latency: "medium" cuts thinking time dramatically and is
-        # plenty for one-shot lookups and actions.
-        self._model_effort = "medium" if quick else "xhigh"
+        # "xhigh" (none/minimal/low/medium/high/xhigh/max). The main agent's
+        # effort rises with the tier: quick trades depth for latency ("medium",
+        # plenty for one-shot lookups), normal runs "xhigh", advanced runs "max".
+        # The oracle always runs "max": it's called only when the main agent is
+        # already stuck, so the extra thinking is cheap at that call volume.
+        self._model_effort = {"quick": "medium", "advanced": "max"}.get(mode, "xhigh")
         self._oracle_effort = "max"
         self.api_key = api_key
         self.cwd = cwd
@@ -6012,8 +6092,8 @@ class Agent:
                 else:
                     print("  ⚠ SearXNG unavailable — web search disabled", file=sys.stderr)
 
-        # Start MCP servers
-        if self.mcp_manager.CONFIG_PATH.exists():
+        # Start MCP servers (not under --browsermcp: no servers under a server)
+        if not getattr(self, '_mcp_mode', False) and self.mcp_manager.CONFIG_PATH.exists():
             self.spinner.start("Starting MCP servers...")
             await self.mcp_manager.start(self.spinner)
             self.spinner.stop()
@@ -6021,6 +6101,13 @@ class Agent:
                 count = len(srv["tools_raw"])
                 sym = "✓" if count else "⚠"
                 print(f"  {sym} MCP:{name} — {count} tools", file=sys.stderr)
+
+        # MCP-server mode (--browsermcp) reuses this Agent purely for its search
+        # and fetch plumbing. Skip the skills report, the interactive input
+        # handler (no TTY, and stdin is the MCP transport), and the nested MCP
+        # manager (it would start OTHER servers under a server).
+        if getattr(self, '_mcp_mode', False):
+            return
 
         # Report loaded skills
         loaded_skills = self.skill_manager.list_skills()
@@ -6642,10 +6729,10 @@ class Agent:
                     msgs.append(m)
         msgs.append({"role": "user", "content": question})
         try:
-            # Sol Pro can reason for ~45 min on hard problems; streaming keeps
-            # the connection alive so it isn't dropped mid-reasoning. 75 min for
-            # pro, 15 min for the standard oracle.
-            oracle_timeout = 4500 if self.oracle_model == ORACLE_PRO else 900
+            # The oracle can reason for many minutes on hard problems at max
+            # effort; streaming keeps the connection alive so it isn't dropped
+            # mid-reasoning. A generous ceiling covers the advanced (Sol) oracle.
+            oracle_timeout = 4500 if self.oracle_model == ADVANCED_ORACLE else 900
             result = await post_completion(
                 self.http, self.headers, {
                     "model": self.oracle_model,
@@ -8781,7 +8868,7 @@ class Agent:
                 existing_meta["oracle_model"] = self.oracle_model
                 existing_meta["cwd"] = str(self.cwd)
                 existing_meta["max_loops"] = max_loops
-                existing_meta["quick"] = self.quick
+                existing_meta["mode"] = self.mode
                 existing_meta["model_overrides"] = self._model_overrides
                 existing_meta.setdefault("thread_id", thread_id)
                 existing_meta["resumed_at"] = now.isoformat()
@@ -8798,7 +8885,7 @@ class Agent:
                     "oracle_model": self.oracle_model,
                     "cwd": str(self.cwd),
                     "max_loops": max_loops,
-                    "quick": self.quick,
+                    "mode": self.mode,
                     "model_overrides": self._model_overrides,
                     "prompt": prompt,
                     "started_at": now.isoformat(),
@@ -9986,9 +10073,9 @@ async def run_agent(prompt, model, oracle_model, api_key, cwd, max_loops,
                     debug, verbose, headed=False, resume_id=None, worker_mode=False,
                     control_file=None, searxng_url=None, pipe_mode=False,
                     notify_desktop=False, notify_email=None, max_cost=None,
-                    tui_mode=False, show_full=False, quick=False,
+                    tui_mode=False, show_full=False, mode="normal",
                     model_overrides=None):
-    agent = Agent(model, oracle_model, api_key, cwd, debug=debug, verbose=verbose, headed=headed, quick=quick)
+    agent = Agent(model, oracle_model, api_key, cwd, debug=debug, verbose=verbose, headed=headed, mode=mode)
     agent._model_overrides = dict(model_overrides or {})
     agent._show_full = show_full
     if show_full:
@@ -10074,9 +10161,10 @@ async def run_agent(prompt, model, oracle_model, api_key, cwd, max_loops,
         await agent.setup()
         if not pipe_mode:
             ov = model_overrides or {}
-            print(f"  ✓ Model: {model}" + (" (quick mode)" if quick else "")
+            tier = "" if mode == "normal" else f" ({mode} mode)"
+            print(f"  ✓ Model: {model}{tier}"
                   + (" [override]" if "main" in ov else ""), file=sys.stderr)
-            if quick:
+            if mode == "quick":
                 print(f"  ✓ Oracle: disabled in quick mode", file=sys.stderr)
             else:
                 print(f"  ✓ Oracle: {oracle_model}" + (" [override]" if "oracle" in ov else ""),
@@ -10242,6 +10330,173 @@ ORCHESTRATOR_TOOLS = [
         },
     },
 ]
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Browser MCP server (--browsermcp)
+# ═══════════════════════════════════════════════════════════════════
+# Exposes dtt's search + browser stack to any other agent over stdio MCP, so a
+# tool built on a raw Playwright/HTTP interface can borrow SearXNG (with the
+# Notte SERP bridge) and Camoufox instead. Four tools: dtt_search, dtt_fetch,
+# dtt_browser (granular steps), dtt_browser_agent (autonomous). It reuses a real
+# Agent in mcp_mode for the proven search/fetch code paths.
+
+BROWSER_MCP_ACTIONS = (
+    "goto", "observe", "click", "fill", "press_key",
+    "scroll_down", "scroll_up", "go_back", "reload", "scrape", "screenshot",
+)
+
+
+def _browser_mcp_tools(types):
+    return [
+        types.Tool(
+            name="dtt_search",
+            description=(
+                "Web search via dtt's local SearXNG (general-web engines fetch "
+                "through a stealth browser, so results aren't the bot-walled "
+                "subset). Returns ranked title/url/snippet results."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "num_results": {"type": "integer", "description": "default 10"},
+                    "categories": {"type": "string", "description": "general (default), news, science, images, videos, it, files, map"},
+                    "engines": {"type": "string", "description": "comma-separated engine names to restrict to"},
+                },
+                "required": ["query"],
+            },
+        ),
+        types.Tool(
+            name="dtt_fetch",
+            description=(
+                "Fetch a URL and return its content. mode='markdown' (default) "
+                "renders in Camoufox and extracts clean article text, clearing "
+                "most bot walls and captchas; mode='text' is a fast no-browser "
+                "fetch; mode='screenshot' saves a PNG and returns its path."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string"},
+                    "mode": {"type": "string", "enum": ["markdown", "text", "screenshot"]},
+                },
+                "required": ["url"],
+            },
+        ),
+        types.Tool(
+            name="dtt_browser",
+            description=(
+                "Drive a persistent stealth browser step by step. Start with "
+                "action='goto' {url}, then action='observe' to get interactable "
+                "element ids, then act: click {id}, fill {id, value}, press_key "
+                "{key}, scroll_down/scroll_up {amount?}, go_back, reload, scrape "
+                "(→ page markdown), screenshot (→ PNG path). The session persists "
+                "across calls, so cookies and navigation carry over."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": list(BROWSER_MCP_ACTIONS)},
+                    "url": {"type": "string", "description": "for goto"},
+                    "id": {"type": "string", "description": "element id from observe, for click/fill"},
+                    "value": {"type": "string", "description": "text, for fill"},
+                    "key": {"type": "string", "description": "key name, for press_key"},
+                    "amount": {"type": "integer", "description": "pixels, for scroll"},
+                },
+                "required": ["action"],
+            },
+        ),
+        types.Tool(
+            name="dtt_browser_agent",
+            description=(
+                "Hand a natural-language goal to dtt's autonomous browser agent "
+                "(Notte + Camoufox). It drives the whole flow — navigation, "
+                "forms, logins, multi-step interactions — and returns the result "
+                "plus the final page. Use for tasks you'd rather not script."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "task": {"type": "string"},
+                    "url": {"type": "string", "description": "optional starting URL"},
+                    "max_steps": {"type": "integer", "description": "default 20, max 50"},
+                },
+                "required": ["task"],
+            },
+        ),
+    ]
+
+
+async def run_browser_mcp():
+    import mcp.types as types
+    import mcp.server.stdio
+    from mcp.server import Server
+
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    if not api_key:
+        print("Error: OPENROUTER_API_KEY not set.", file=sys.stderr)
+        return
+
+    print("▸ Starting dtt browser MCP server (stdio)...", file=sys.stderr)
+    agent = Agent(NORMAL_MAIN, NORMAL_ORACLE, api_key, str(Path.cwd()),
+                  mode="normal")
+    agent._mcp_mode = True
+    agent.spinner = Spinner(enabled=False)
+    await agent.setup()
+    print("  ✓ search + browser stack ready. Tools: dtt_search, dtt_fetch, "
+          "dtt_browser, dtt_browser_agent", file=sys.stderr)
+
+    async def on_list_tools(ctx, params):
+        return types.ListToolsResult(tools=_browser_mcp_tools(types))
+
+    async def dispatch(name, a):
+        if name == "dtt_search":
+            return await agent._tool_search_web(
+                a["query"], num_results=a.get("num_results"),
+                categories=a.get("categories"), engines=a.get("engines"))
+        if name == "dtt_fetch":
+            return await agent._tool_fetch_page(a["url"], mode=a.get("mode"))
+        if name == "dtt_browser_agent":
+            return await agent._tool_browser_agent(
+                a["task"], url=a.get("url"), max_steps=a.get("max_steps", 20))
+        if name == "dtt_browser":
+            action = a.get("action")
+            if action not in BROWSER_MCP_ACTIONS:
+                return f"Error: unknown action '{action}'. Valid: {', '.join(BROWSER_MCP_ACTIONS)}."
+            params = {}
+            if action == "goto":
+                params["url"] = a.get("url")
+            elif action in ("click", "fill"):
+                params["id"] = a.get("id")
+                if action == "fill":
+                    params["value"] = a.get("value")
+            elif action == "press_key":
+                params["key"] = a.get("key")
+            elif action in ("scroll_down", "scroll_up") and a.get("amount"):
+                params["amount"] = a.get("amount")
+            result = await agent.browser.act(action, **params)
+            return json.dumps(result, indent=1, default=str)[:20000]
+        return f"Error: unknown tool '{name}'."
+
+    async def on_call_tool(ctx, params):
+        try:
+            text = await dispatch(params.name, params.arguments or {})
+            return types.CallToolResult(content=[types.TextContent(type="text", text=str(text))])
+        except Exception as e:
+            if os.environ.get("DTT_DEBUG"):
+                traceback.print_exc()
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=f"Error: {e}")],
+                is_error=True)
+
+    server = Server("dothething-browser", version="1.0",
+                    on_list_tools=on_list_tools, on_call_tool=on_call_tool)
+    try:
+        async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
+            await server.run(read_stream, write_stream, server.create_initialization_options())
+    finally:
+        await agent.cleanup()
 
 
 class OrchestratorApp:
@@ -10798,7 +11053,7 @@ class OrchestratorApp:
 
                             data = await post_completion(
                                 client, _make_headers(orchestrator.api_key), {
-                                    "model": FABLE,
+                                    "model": ADVANCED_MAIN,
                                     "messages": messages,
                                     "tools": ORCHESTRATOR_TOOLS,
                                     "tool_choice": "auto",
@@ -10918,20 +11173,21 @@ def main():
     parser = argparse.ArgumentParser(
         prog="dothething",
         description="Autonomous AI agent — https://dotheth.ing",
-        usage="dothething [q] [--fast] [--oraclepro] [--resume ID] [prompt ...]",
+        usage="dothething [q] [--advanced] [--resume ID] [prompt ...]",
     )
-    parser.add_argument("--fast", action="store_true", help="Use claude-opus-4.8-fast:online")
     parser.add_argument("--quick", "-q", action="store_true",
-                        help="Quick mode: one-shot the task on Opus 4.8 with stacked tool calls, "
-                             "no oracle, minimal turns. Combine with --fast for Opus 4.8-fast. "
-                             "Shortcut: a leading positional 'q' "
-                             "(e.g. dtt q \"what's the weather in Cape Town\")")
-    parser.add_argument("--oraclepro", action="store_true", help="Use gpt-5.6-sol-pro for oracle (default: gpt-5.6-sol)")
+                        help="Quick mode: one-shot the task on a fast frontier model with "
+                             "stacked tool calls, no oracle, minimal turns. Shortcut: a "
+                             "leading positional 'q' (e.g. dtt q \"weather in Cape Town\")")
+    parser.add_argument("--advanced", action="store_true",
+                        help="Advanced mode: the top-tier models (Fable + GPT-5.6 Sol oracle) "
+                             "at max reasoning effort, for hard tasks. Default is the cheaper, "
+                             "faster normal tier.")
     parser.add_argument("--model", action="append", default=[], metavar="[ROLE=]SLUG",
                         help="Override the model for a role: main, worker, oracle, or browser "
                              "(e.g. --model oracle=x-ai/grok-5 --model worker=google/gemini-3.5-flash-lite). "
                              "A bare slug targets main. Repeatable. ROLE=default clears a saved/env "
-                             "override. Takes precedence over q/--fast/--oraclepro defaults; persists "
+                             "override. Takes precedence over q/--advanced defaults; persists "
                              "across --resume; DTT_MODEL_<ROLE> env vars do the same with lower precedence.")
     parser.add_argument("--prompt", type=str, default=None, help="Inline prompt text")
     parser.add_argument("--cwd", type=str, default=".", help="Working directory for relative paths")
@@ -10943,6 +11199,7 @@ def main():
     parser.add_argument("--show-full", action="store_true", help="Stream the model's thinking live and show full, untruncated tool calls as they start and finish (disables the spinner; a verbose firehose for watching/debugging a run — lets you see what a long-running tool is currently doing)")
     parser.add_argument("--debug", action="store_true", help="Debug-level API payload logging")
     parser.add_argument("--orchestrator", action="store_true", help="Launch orchestrator mode (manage multiple parallel agents)")
+    parser.add_argument("--browsermcp", action="store_true", help="Run a stdio MCP server exposing dtt's search + browser tools (dtt_search, dtt_fetch, dtt_browser, dtt_browser_agent) to another agent")
     parser.add_argument("--pipe", action="store_true", help="Pipe mode: final report to stdout, everything else suppressed")
     parser.add_argument("--tui", action="store_true", help="Full-screen terminal UI for single-agent mode (experimental)")
     parser.add_argument("--notify-desktop", action="store_true", help="Send a desktop notification when the task completes")
@@ -10957,29 +11214,45 @@ def main():
     parser.add_argument("positional_prompt", nargs="*", help="Task prompt (omit for interactive editor)")
     args = parser.parse_args()
 
-    global WORKER, BROWSER_AGENT_MODEL
+    global WORKER, BROWSER_AGENT_MODEL, PERCEPTION_MODEL
 
     api_key = os.environ.get("OPENROUTER_API_KEY")
     if not api_key:
         print("Error: OPENROUTER_API_KEY environment variable not set.", file=sys.stderr)
         sys.exit(1)
 
+    # Browser MCP server: a distinct entrypoint that serves stdio and exits.
+    if getattr(args, 'browsermcp', False):
+        try:
+            asyncio.run(run_browser_mcp())
+        except KeyboardInterrupt:
+            pass
+        return
+
     cli_overrides = _parse_model_overrides(getattr(args, 'model', None))
     saved_overrides = {}
 
-    # Quick mode: --quick/-q, or a leading positional "q" (dtt q "...").
+    # Three modes. Default is "normal" (cheap tier, xhigh). "quick" (q/--quick,
+    # or a leading positional "q") one-shots on a fast frontier model with no
+    # oracle. "advanced" (--advanced) uses the Fable tier at max reasoning.
     quick = getattr(args, 'quick', False)
     if args.positional_prompt and args.positional_prompt[0] == "q":
         quick = True
         args.positional_prompt = args.positional_prompt[1:]
+    advanced = getattr(args, 'advanced', False)
+    if quick and advanced:
+        print("Error: quick mode (q/--quick) and --advanced are mutually exclusive.", file=sys.stderr)
+        sys.exit(1)
+    mode = "quick" if quick else ("advanced" if advanced else "normal")
 
-    # Quick mode runs normal Opus 4.8; add --fast for the pricier -fast variant.
-    # Outside quick mode, --fast keeps its old meaning (Opus 4.8-fast vs Fable).
-    if quick:
-        model = OPUS_FAST if args.fast else OPUS
-    else:
-        model = OPUS_FAST if args.fast else FABLE
-    oracle_model = ORACLE_PRO if args.oraclepro else ORACLE_DEFAULT
+    def _models_for(m):
+        if m == "quick":
+            return QUICK_MODEL, NORMAL_ORACLE   # oracle unused (tool excluded)
+        if m == "advanced":
+            return ADVANCED_MAIN, ADVANCED_ORACLE
+        return NORMAL_MAIN, NORMAL_ORACLE
+
+    model, oracle_model = _models_for(mode)
     cwd = str(Path(args.cwd).expanduser().resolve())
     max_loops = args.max_loops  # None until defaulted below (after resume inherit)
 
@@ -10992,21 +11265,20 @@ def main():
             _rmeta = {}
         def _passed(flag):
             return any(a == flag or a.startswith(flag + "=") for a in sys.argv)
-        if _rmeta.get("quick"):
-            quick = True
-            model = OPUS_FAST if (_passed("--fast") or _rmeta.get("model") == OPUS_FAST) else OPUS
-        if not _passed("--fast") and _rmeta.get("model") == OPUS_FAST:
-            model = OPUS_FAST
-        if not _passed("--oraclepro") and _rmeta.get("oracle_model") == ORACLE_PRO:
-            oracle_model = ORACLE_PRO
+        saved_mode = _rmeta.get("mode")
+        # Inherit the saved mode only when the user didn't pick one this time.
+        if saved_mode and not (quick or advanced) and saved_mode in ("quick", "normal", "advanced"):
+            mode = saved_mode
+            quick = (mode == "quick")
+            advanced = (mode == "advanced")
+            model, oracle_model = _models_for(mode)
         if not _passed("--cwd") and _rmeta.get("cwd"):
             cwd = str(Path(_rmeta["cwd"]).expanduser().resolve())
         if max_loops is None and _rmeta.get("max_loops"):
             max_loops = _rmeta["max_loops"]
         saved_overrides = dict(_rmeta.get("model_overrides") or {})
         if _rmeta:
-            print(f"    Inherited config: {('quick+fast' if model == OPUS_FAST else 'quick') if quick else ('fast' if model == OPUS_FAST else 'standard')} mode, "
-                  f"{'pro' if oracle_model == ORACLE_PRO else 'standard'} oracle, "
+            print(f"    Inherited config: {mode} mode, "
                   f"max_loops={max_loops or (QUICK_MAX_LOOPS if quick else MAX_LOOPS)}, "
                   f"cwd={cwd}"
                   + (f", model_overrides={saved_overrides}" if saved_overrides else ""),
@@ -11018,6 +11290,16 @@ def main():
     if quick and args.orchestrator:
         print("Error: quick mode (q/--quick) and --orchestrator are mutually exclusive.", file=sys.stderr)
         sys.exit(1)
+
+    # Advanced tier repoints the worker/browser/perception models too, before
+    # the override layer and the Notte config rewrite below act on them.
+    if advanced:
+        WORKER_DEFAULT_EFF = ADVANCED_WORKER
+        BROWSER_DEFAULT_EFF = ADVANCED_BROWSER
+        PERCEPTION_MODEL = ADVANCED_PERCEPTION
+    else:
+        WORKER_DEFAULT_EFF = WORKER_DEFAULT
+        BROWSER_DEFAULT_EFF = BROWSER_AGENT_MODEL_DEFAULT
 
     # Per-role model overrides, lowest to highest precedence: DTT_MODEL_<ROLE>
     # env vars, the resumed thread's saved overrides, then --model flags. The
@@ -11038,9 +11320,9 @@ def main():
         model = model_overrides["main"]
     if "oracle" in model_overrides:
         oracle_model = model_overrides["oracle"]
-    WORKER = model_overrides.get("worker", WORKER_DEFAULT)
-    desired_browser = model_overrides.get("browser", BROWSER_AGENT_MODEL_DEFAULT)
-    if desired_browser != BROWSER_AGENT_MODEL:
+    WORKER = model_overrides.get("worker", WORKER_DEFAULT_EFF)
+    desired_browser = model_overrides.get("browser", BROWSER_DEFAULT_EFF)
+    if desired_browser != BROWSER_AGENT_MODEL or PERCEPTION_MODEL != _PERCEPTION_AT_IMPORT:
         BROWSER_AGENT_MODEL = desired_browser
         # A per-run config file, so parallel runs with different overrides
         # don't clobber each other's shared TOML.
@@ -11130,7 +11412,7 @@ def main():
             max_cost=getattr(args, 'max_cost', None),
             tui_mode=getattr(args, 'tui', False),
             show_full=getattr(args, 'show_full', False),
-            quick=quick,
+            mode=mode,
             model_overrides=model_overrides,
         ))
     except KeyboardInterrupt:
@@ -11141,6 +11423,11 @@ if __name__ == "__main__":
     main()
 PYTHON_AGENT
 
-python "$BASE/agent.py" "${PASS_ARGS[@]}" && _dtt_status=0 || _dtt_status=$?
-dtt_update || true
+if [ "$BROWSER_MCP" = true ]; then
+  # Restore the real stdout (fd3) as the server's JSON-RPC channel.
+  python "$BASE/agent.py" "${PASS_ARGS[@]}" 1>&3 3>&- && _dtt_status=0 || _dtt_status=$?
+else
+  python "$BASE/agent.py" "${PASS_ARGS[@]}" && _dtt_status=0 || _dtt_status=$?
+fi
+dtt_update >&2 2>/dev/null || true
 exit "$_dtt_status"

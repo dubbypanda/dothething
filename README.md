@@ -155,6 +155,26 @@ Call `dtt_browser_session({"action":"status"})` to inspect the current session, 
 
 Search, fetch, browser steps, and session control need no OpenRouter key in MCP mode. Only `dtt_browser_agent` requires `OPENROUTER_API_KEY`.
 
+`dtt_browser` supports direct page operations as well as Notte's `observe`, `click`, `fill`, and navigation actions:
+
+| Action | Parameters | Result |
+|---|---|---|
+| `tabs` | None | `tabs` array with each tab's `tab_id`, `url`, and `active` state |
+| `tab_new` | Optional `url` | Opens and selects a tab; returns its `tab_id` and `url` |
+| `tab_select` | `tab_id` | Selects the default tab; returns its `tab_id` and `url` |
+| `tab_close` | `tab_id` | Closes the tab; returns its `tab_id` and `closed: true` |
+| `evaluate` | `code`, optional `tab_id` | Executes JavaScript in the page; returns `{"value": ...}` as complete JSON |
+| `wait_for` | `selector`, optional `tab_id` and `timeout_ms` | Waits for a visible element; returns `tab_id`, `url`, and `found: true` |
+| `upload_files` | `selector`, `paths`, optional `tab_id` and `timeout_ms` | Sets a file input's files; returns `tab_id`, `url`, and the `uploaded` paths |
+
+All tabs use the same saved browser context, including its login state. Tab IDs stay stable through navigation and other tabs' closure; a browser restart invalidates them. An explicit `tab_id` on page operations, including the existing `goto`, `observe`, and `click` actions, targets that tab without changing the default. If you close the final tab, DTT creates a blank replacement to keep the context open.
+
+`tab_new` with a URL returns when navigation commits. Scripts and other resources can still be pending. Take the returned `tab_id` and call `wait_for` with the selector your next action needs, then inspect the page. Both `wait_for` and `upload_files` default to 30,000 ms and accept a timeout up to 120,000 ms.
+
+`evaluate` returns the script's last expression. For example, `{"action":"evaluate","code":"window.foo='';'ok'"}` returns `{"value":"ok"}`. Statements can change page state, and the final expression can return an object, array, string, number, boolean, or null. DTT also waits for a returned promise. Unicode and large JSON results remain intact; values that JSON can't represent, such as `NaN`, produce an error. Bounded `observe` and `scrape` results include a `truncated` flag and the original element or character count.
+
+For `upload_files`, `selector` must identify a file input and `paths` must contain absolute paths to existing local files. DTT uses Playwright's native `set_input_files`, which updates the input and fires its change event. Inspect the application's upload state before the next step. These operations share the browser's operation lock and remain paused during a manual login handoff.
+
 ## How it works
 
 Every model call routes through OpenRouter. Each turn, the agent decides which tools to call, reads the results, and decides what to do next. It keeps going until the task is done or it hits the loop or cost limit.

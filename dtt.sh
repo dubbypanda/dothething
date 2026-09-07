@@ -239,8 +239,8 @@ Flags:
   --headed        Show the browser window, including in --browsermcp mode
   --headless      Hide the browser window; overrides a resumed thread's setting
   --browsermcp    Expose search and browser tools through a stdio MCP server.
-                  Use dtt_browser_session to open a window for manual login,
-                  then resume automation with the saved login.
+                  Use dtt_browser_session action=login for manual login.
+                  Close the login browser when done; dtt continues headless.
   --orchestrator  Launch orchestrator mode (manage multiple parallel agents)
   --pipe          Pipe mode: only final report on stdout, all other output suppressed
   --tui           Full-screen terminal UI for single-agent mode (experimental)
@@ -1948,16 +1948,23 @@ class Browser:
         "initializing", "spinner", "skeleton",
     ]
 
-    def __init__(self, headless=True, session_name=None, state_file=None):
+    def __init__(self, headless=True, session_name=None, profile_dir=None):
         self._session = None
         self._lock = asyncio.Lock()
         self._operation_lock = asyncio.Lock()
         self._headless = headless
         self._paused = False
-        self._state_lock = None
+        self._profile_lock = None
+        self._temporary_profile = None
+        self._legacy_state_file = None
         self._legacy_cookie_file = None
+        self._login_task = None
+        self._login_state = None
+        self._login_error = None
+        self._login_url = None
+        self._last_url = None
         self.session_name = None
-        self._state_file = Path(state_file) if state_file else None
+        self._profile_dir = Path(profile_dir) if profile_dir else None
         if session_name is not None:
             self._select_session(session_name)
 
@@ -1969,22 +1976,32 @@ class Browser:
 
     def _select_session(self, name):
         self.session_name = self.validate_session_name(name)
-        self._state_file = Path.home() / ".dtt" / "browser-sessions" / name / "storage.json"
-        self._legacy_cookie_file = None
+        directory = Path.home() / ".dtt" / "browser-sessions" / name
+        self.set_profile(directory / "profile", legacy_state_file=directory / "storage.json")
 
-    def set_state_file(self, path, legacy_cookie_file=None):
+    def set_profile(self, profile_dir, legacy_state_file=None, legacy_cookie_file=None):
         if self._session is not None:
-            raise RuntimeError("Close the browser before changing its state file.")
-        self._state_file = Path(path)
+            raise RuntimeError("Close the browser before changing its profile.")
+        if self._temporary_profile is not None:
+            self._temporary_profile.cleanup()
+            self._temporary_profile = None
+        self._profile_dir = Path(profile_dir)
+        self._legacy_state_file = Path(legacy_state_file) if legacy_state_file else None
         self._legacy_cookie_file = Path(legacy_cookie_file) if legacy_cookie_file else None
 
-    def _acquire_state_lock(self):
-        if self._state_file is None or self._state_lock is not None:
+    def _acquire_profile_lock(self):
+        if self._profile_lock is not None:
             return
         import fcntl
-        directory = self._state_file.parent
+        if self._profile_dir is None:
+            BASE.mkdir(parents=True, exist_ok=True)
+            self._temporary_profile = tempfile.TemporaryDirectory(prefix="browser-", dir=BASE)
+            self._profile_dir = Path(self._temporary_profile.name) / "profile"
+        directory = self._profile_dir.parent
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         directory.chmod(0o700)
+        self._profile_dir.mkdir(mode=0o700, exist_ok=True)
+        self._profile_dir.chmod(0o700)
         fd = os.open(directory / ".lock", os.O_CREAT | os.O_RDWR, 0o600)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1994,53 +2011,73 @@ class Browser:
                 f"Browser session '{self.session_name or directory.name}' is in use by another process. "
                 "Close that browser session or select a different --browser-session name."
             ) from None
-        self._state_lock = fd
+        self._profile_lock = fd
 
-    def _release_state_lock(self):
-        if self._state_lock is not None:
-            os.close(self._state_lock)
-            self._state_lock = None
+    def _release_profile_lock(self):
+        if self._profile_lock is not None:
+            os.close(self._profile_lock)
+            self._profile_lock = None
 
-    async def _save_state(self, session):
-        if self._state_file is None:
-            return
-        state = await session.window.page.context.storage_state(indexed_db=True)
-        fd, temp_path = tempfile.mkstemp(prefix=".storage-", dir=self._state_file.parent)
+    async def _start_session(self):
+        import notte
+        from camoufox.async_api import AsyncCamoufox
+        from notte_browser.window import BrowserResource, BrowserWindow, BrowserWindowOptions
+        from notte_sdk.types import SessionStartRequest
+        _configure_redacted_loguru_logging()
+        settings = dict(
+            headless=self._headless,
+            browser_type="camoufox",
+            solve_captchas=bool(os.environ.get("TWOCAPTCHA_API_KEY")),
+            viewport_width=DEFAULT_HEADLESS_VIEWPORT_WIDTH,
+            viewport_height=DEFAULT_HEADLESS_VIEWPORT_HEIGHT,
+        )
+        options = BrowserWindowOptions.from_request(SessionStartRequest(**settings))
+        manager = AsyncCamoufox(
+            headless=self._headless,
+            persistent_context=True,
+            user_data_dir=str(self._profile_dir),
+            firefox_user_prefs={
+                "media.volume_scale": "0.0",
+                "browser.startup.page": 3,
+                "browser.sessionstore.resume_from_crash": True,
+                # Camoufox defaults to 2, which drops session cookies on quit.
+                "browser.sessionstore.privacy_level": 0,
+            },
+        )
+        context = await manager.__aenter__()
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as out:
-                json.dump(state, out, ensure_ascii=False)
-                out.flush()
-                os.fsync(out.fileno())
-            os.replace(temp_path, self._state_file)
-        finally:
-            Path(temp_path).unlink(missing_ok=True)
-        # Old thread caches contain cookies only. Remove each old file after
-        # its first successful snapshot; this path retires as those caches migrate.
-        if self._legacy_cookie_file:
-            self._legacy_cookie_file.unlink(missing_ok=True)
-            self._legacy_cookie_file = None
+            page = context.pages[-1] if context.pages else await context.new_page()
+
+            async def on_close():
+                await manager.__aexit__(None, None, None)
+
+            window = BrowserWindow(
+                resource=BrowserResource.model_construct(page=page, options=options),
+                on_close=on_close,
+            )
+            session = notte.Session(window=window, perception_type="fast", **settings)
+            from notte_browser.captcha import CaptchaHandler
+            if CaptchaHandler.is_available:
+                await context.add_init_script(CaptchaHandler.CAPTCHA_PROBE_INIT_JS)
+            await session.__aenter__()
+            return session
+        except BaseException:
+            await manager.__aexit__(None, None, None)
+            raise
 
     async def _ensure(self):
         async with self._lock:
             if self._session is not None and self._session.window.page.is_closed():
-                await self._close_session(save=False)
+                await self._close_session(release_lock=False)
             if self._session is None:
-                import notte
-                _configure_redacted_loguru_logging()
-                self._acquire_state_lock()
+                self._acquire_profile_lock()
                 session = None
                 try:
-                    session = notte.Session(
-                        headless=self._headless,
-                        browser_type="camoufox",
-                        solve_captchas=bool(os.environ.get("TWOCAPTCHA_API_KEY")),
-                        perception_type="fast",
-                        viewport_width=DEFAULT_HEADLESS_VIEWPORT_WIDTH,
-                        viewport_height=DEFAULT_HEADLESS_VIEWPORT_HEIGHT,
-                    )
-                    await session.__aenter__()
-                    if self._state_file and self._state_file.exists():
-                        await session.window.page.context.set_storage_state(self._state_file)
+                    session = await self._start_session()
+                    # Import old snapshots once. Retire this reader after existing
+                    # named sessions and thread caches have migrated to profiles.
+                    if self._legacy_state_file and self._legacy_state_file.exists():
+                        await session.window.page.context.set_storage_state(self._legacy_state_file)
                     elif self._legacy_cookie_file and self._legacy_cookie_file.exists():
                         await session.aset_cookies(cookie_file=self._legacy_cookie_file)
                     self._session = session
@@ -2048,80 +2085,170 @@ class Browser:
                     if session is not None:
                         with contextlib.suppress(Exception):
                             await session.__aexit__(None, None, None)
-                    self._release_state_lock()
+                    self._release_profile_lock()
                     raise
             return self._session
 
     def _check_automation(self):
         if self._paused:
-            raise RuntimeError("Browser automation is paused for a manual login. Wait for the user, then call the browser session control tool with action='resume'.")
+            if self._login_state:
+                raise RuntimeError("Browser automation is paused; login handoff is " + self._login_state + ". Use the browser session control tool with action='wait'; do not resume before the user closes the login browser.")
+            raise RuntimeError("Browser automation is paused for manual control. Wait for the user, then call the browser session control tool with action='resume'.")
 
     def _status(self):
+        page = self._session.window.page if self._session else None
+        live_pages = [tab for tab in page.context.pages if not tab.is_closed()] if page else []
+        if page not in live_pages:
+            page = live_pages[-1] if live_pages else None
         return {
             "session": self.session_name,
-            "state_file": str(self._state_file) if self._state_file else None,
-            "open": self._session is not None and not self._session.window.page.is_closed(),
+            "profile_dir": str(self._profile_dir) if self._profile_dir else None,
+            "open": bool(live_pages),
             "headed": not self._headless,
             "paused": self._paused,
-            "url": self._session.window.page.url if self._session else None,
+            "url": page.url if page else self._last_url,
+            "login_state": self._login_state,
+            "login_error": self._login_error,
         }
 
-    async def _close_session(self, save=True):
+    async def _close_session(self, release_lock=True):
         session = self._session
         try:
             if session is not None:
-                try:
-                    if save:
-                        await self._save_state(session)
-                finally:
-                    await session.__aexit__(None, None, None)
+                self._last_url = session.window.page.url
+                await session.__aexit__(None, None, None)
+                # Native shutdown flushes the imported state before its old files go.
+                for legacy in (self._legacy_state_file, self._legacy_cookie_file):
+                    if legacy:
+                        legacy.unlink(missing_ok=True)
+                self._legacy_state_file = self._legacy_cookie_file = None
         finally:
             self._session = None
-            self._release_state_lock()
+            if release_lock:
+                self._release_profile_lock()
 
-    async def control(self, action, session=None, headed=None, url=None):
-        if action not in ("status", "open", "resume", "close"):
-            raise ValueError("Unknown browser session action. Use status, open, resume or close.")
-        if action != "open" and (session is not None or url is not None):
-            raise ValueError("session and url are only valid with action='open'.")
+    async def _cancel_login(self):
+        if self._login_task is not None and not self._login_task.done():
+            self._login_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._login_task
+        self._login_task = None
+        self._login_state = None
+        self._login_error = None
+
+    def _begin_login(self, session):
+        context = session.window.page.context
+        closed = asyncio.Event()
+        listeners = []
+        self._last_url = session.window.page.url
+        self._login_state = "waiting_for_close"
+        self._login_error = None
+
+        def listen(emitter, event, callback):
+            emitter.on(event, callback)
+            listeners.append((emitter, event, callback))
+
+        def page_closed(*args):
+            if not any(not page.is_closed() for page in context.pages):
+                closed.set()
+
+        def watch_page(page):
+            def navigated(frame):
+                if frame == page.main_frame and page.url != "about:blank":
+                    self._last_url = page.url
+            listen(page, "framenavigated", navigated)
+            listen(page, "close", page_closed)
+
+        listen(context, "close", lambda *args: closed.set())
+        listen(context, "page", watch_page)
+        for page in context.pages:
+            watch_page(page)
+        page_closed()
+
+        async def monitor():
+            try:
+                await closed.wait()
+                async with self._operation_lock:
+                    self._login_state = "restarting"
+                    target = self._last_url
+                    # Keep the process lock through native shutdown and relaunch.
+                    await self._close_session(release_lock=False)
+                    self._headless = True
+                    active = await self._ensure()
+                    if target and target != "about:blank":
+                        result = await active.aexecute(type="goto", url=target)
+                        if not result.success:
+                            raise RuntimeError(f"Could not reopen {target}: {result.message}")
+                    self._paused = False
+                    self._login_state = "ready"
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                self._login_state = "failed"
+                self._login_error = str(error)
+                self._paused = True
+            finally:
+                for emitter, event, callback in listeners:
+                    emitter.remove_listener(event, callback)
+
+        self._login_task = asyncio.create_task(monitor(), name="dtt-browser-login")
+
+    async def control(self, action, session=None, headed=None, url=None, timeout_seconds=30):
+        if action not in ("status", "open", "resume", "close", "login", "wait"):
+            raise ValueError("Unknown browser session action. Use login, wait, status, open, resume or close.")
+        if action not in ("open", "login") and (session is not None or url is not None):
+            raise ValueError("session and url are only valid with action='open' or 'login'.")
         if headed is not None:
             if not isinstance(headed, bool):
                 raise ValueError("headed must be a boolean.")
             if action not in ("open", "resume"):
                 raise ValueError("headed is only valid with action='open' or 'resume'.")
+        if action == "wait":
+            if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)) or not 0 < timeout_seconds <= 30:
+                raise ValueError("timeout_seconds must be greater than 0 and at most 30.")
+            task = self._login_task
+            if task is not None:
+                try:
+                    await asyncio.wait_for(asyncio.shield(task), timeout=timeout_seconds)
+                except asyncio.TimeoutError:
+                    pass
+                except asyncio.CancelledError:
+                    if not task.cancelled():
+                        raise
+            return self._status()
+        if action == "status":
+            return self._status()
         async with self._operation_lock:
-            if action == "status":
-                return self._status()
             if action == "close":
+                await self._cancel_login()
                 await self._close_session()
                 self._paused = False
                 return self._status()
+            if self._login_task is not None and not self._login_task.done():
+                if action == "login" and (session is None or session == self.session_name) and (url is None or url == self._login_url):
+                    return self._status()
+                raise RuntimeError("A login handoff is already active. Use wait, or close it before starting another.")
             if action == "resume":
+                if self._login_state == "failed":
+                    raise RuntimeError("The login handoff failed. Use login to retry or close to stop it.")
                 if self._session is None:
                     raise RuntimeError("No browser is open. Call the browser session control tool with action='open' first.")
-                if self._session.window.page.is_closed():
-                    raise RuntimeError("The login window was closed. Call the browser session control tool with action='open' to reopen it.")
                 if headed is None:
                     headed = not self._headless
             if session is not None:
                 self.validate_session_name(session)
-            headless = not (True if headed is None else headed)
+            headless = False if action == "login" else not (True if headed is None else headed)
             changing_session = session is not None and session != self.session_name
             previous_url = None
-            memory_state = None
             self._paused = True
             if self._session is not None and (changing_session or headless != self._headless):
                 if not changing_session:
                     previous_url = self._session.window.page.url
-                    if self._state_file is None:
-                        memory_state = await self._session.window.page.context.storage_state(indexed_db=True)
-                await self._close_session()
+                await self._close_session(release_lock=changing_session)
             if changing_session:
                 self._select_session(session)
             self._headless = headless
             active = await self._ensure()
-            if memory_state is not None:
-                await active.window.page.context.set_storage_state(memory_state)
             target = url or previous_url
             if target and target != "about:blank":
                 result = await active.aexecute(type="goto", url=target)
@@ -2129,11 +2256,15 @@ class Browser:
                     raise RuntimeError(f"Error navigating to {target}: {result.message}")
             if not self._headless:
                 await active.window.page.bring_to_front()
-            await self._save_state(active)
+            self._login_state = self._login_error = None
+            if action == "login":
+                self._login_url = url
+                self._begin_login(active)
+                return {**self._status(), "message": "Complete the login, then close all windows of this login browser or quit it. DTT will reopen the same profile headless. Use wait for completion, then inspect the page to check the login."}
             if action == "resume":
                 self._paused = False
                 return self._status()
-            return {**self._status(), "message": "Complete the login in the browser and leave the window open. Wait for the user's confirmation, then call the browser session control tool with action='resume' to continue."}
+            return {**self._status(), "message": "Manual control is active. Tell the agent when to resume. Use login instead for automatic continuation when this browser closes."}
 
     @staticmethod
     def _looks_like_captcha(text):
@@ -2419,8 +2550,6 @@ class Browser:
 
           except Exception as e:
             return f"Error fetching {url}: {e}"
-          finally:
-            await self._save_state(session)
 
     async def fetch_serp(self, url, timeout_ms=30000, method="GET",
                          form=None, body_json=None, body_text=None, mode="fetch"):
@@ -2454,78 +2583,75 @@ class Browser:
                 session = await self._ensure()
             except Exception as e:
                 raise RuntimeError(f"browser launch failed: {e}") from e
-            try:
+            page = session.window.page
+            if origin and not (page.url or "").startswith(origin):
+                result = await session.aexecute(type="goto", url=origin)
+                if not result.success:
+                    raise RuntimeError(f"navigation failed: {result.message}")
                 page = session.window.page
-                if origin and not (page.url or "").startswith(origin):
-                    result = await session.aexecute(type="goto", url=origin)
-                    if not result.success:
-                        raise RuntimeError(f"navigation failed: {result.message}")
-                    page = session.window.page
-                    await self._settle_page(session, page, min(timeout_ms, 20000))
+                await self._settle_page(session, page, min(timeout_ms, 20000))
 
-                budget = max(5000, min(timeout_ms, 60000))
+            budget = max(5000, min(timeout_ms, 60000))
 
-                if mode == "navigate":
-                    # Google hands a fetch() the same "enable JavaScript" stub
-                    # it gives a plain HTTP client, and only serves the real
-                    # results to a navigation.
-                    result = await session.aexecute(type="goto", url=url)
-                    if not result.success:
-                        raise RuntimeError(f"navigation failed: {result.message}")
-                    page = session.window.page
-                    await self._settle_page(session, page, budget)
-                    return {"html": await page.content(), "url": page.url, "status": 200}
+            if mode == "navigate":
+                # Google hands a fetch() the same "enable JavaScript" stub
+                # it gives a plain HTTP client, and only serves the real
+                # results to a navigation.
+                result = await session.aexecute(type="goto", url=url)
+                if not result.success:
+                    raise RuntimeError(f"navigation failed: {result.message}")
+                page = session.window.page
+                await self._settle_page(session, page, budget)
+                return {"html": await page.content(), "url": page.url, "status": 200}
 
-                # Bounded on both sides: SearXNG gives up on the engine at its
-                # own timeout, and a fetch still running after that would pin
-                # this session out of the pool for every later search.
-                payload = await asyncio.wait_for(
-                    page.evaluate(
-                        """async (args) => {
-                            const opts = {
-                                method: args.method || "GET",
-                                credentials: "include",
-                                redirect: "follow",
-                                signal: AbortSignal.timeout(args.budget),
-                            };
-                            if (args.form) {
-                                // URLSearchParams sets the form content-type
-                                // for us, which is what these endpoints want.
-                                opts.body = new URLSearchParams(args.form);
-                            } else if (args.bodyJson) {
-                                opts.body = JSON.stringify(args.bodyJson);
-                                opts.headers = {"Content-Type": "application/json"};
-                            } else if (args.bodyText) {
-                                opts.body = args.bodyText;
-                            }
-                            try {
-                                const r = await fetch(args.url, opts);
-                                return {ok: true, status: r.status, url: r.url,
-                                        text: await r.text()};
-                            } catch (e) {
-                                return {ok: false, error: String(e)};
-                            }
-                        }""",
-                        {
-                            "url": url,
-                            "budget": budget,
-                            "method": (method or "GET").upper(),
-                            "form": form or None,
-                            "bodyJson": body_json,
-                            "bodyText": body_text,
-                        },
-                    ),
-                    timeout=(budget / 1000) + 5,
-                )
-                if not payload.get("ok"):
-                    raise RuntimeError(payload.get("error") or "fetch failed")
-                return {
-                    "html": payload.get("text") or "",
-                    "url": payload.get("url") or url,
-                    "status": int(payload.get("status") or 200),
-                }
-            finally:
-                await self._save_state(session)
+            # Bounded on both sides: SearXNG gives up on the engine at its
+            # own timeout, and a fetch still running after that would pin
+            # this session out of the pool for every later search.
+            payload = await asyncio.wait_for(
+                page.evaluate(
+                    """async (args) => {
+                        const opts = {
+                            method: args.method || "GET",
+                            credentials: "include",
+                            redirect: "follow",
+                            signal: AbortSignal.timeout(args.budget),
+                        };
+                        if (args.form) {
+                            // URLSearchParams sets the form content-type
+                            // for us, which is what these endpoints want.
+                            opts.body = new URLSearchParams(args.form);
+                        } else if (args.bodyJson) {
+                            opts.body = JSON.stringify(args.bodyJson);
+                            opts.headers = {"Content-Type": "application/json"};
+                        } else if (args.bodyText) {
+                            opts.body = args.bodyText;
+                        }
+                        try {
+                            const r = await fetch(args.url, opts);
+                            return {ok: true, status: r.status, url: r.url,
+                                    text: await r.text()};
+                        } catch (e) {
+                            return {ok: false, error: String(e)};
+                        }
+                    }""",
+                    {
+                        "url": url,
+                        "budget": budget,
+                        "method": (method or "GET").upper(),
+                        "form": form or None,
+                        "bodyJson": body_json,
+                        "bodyText": body_text,
+                    },
+                ),
+                timeout=(budget / 1000) + 5,
+            )
+            if not payload.get("ok"):
+                raise RuntimeError(payload.get("error") or "fetch failed")
+            return {
+                "html": payload.get("text") or "",
+                "url": payload.get("url") or url,
+                "status": int(payload.get("status") or 200),
+            }
 
     async def act(self, action, **params):
         """Granular step against the persistent session, for the browser MCP.
@@ -2537,78 +2663,79 @@ class Browser:
         async with self._operation_lock:
             self._check_automation()
             session = await self._ensure()
-            try:
-                if action == "observe":
-                    obs = await session.aobserve()
-                    els = []
-                    space = getattr(obs, "space", None)
-                    for a in (getattr(space, "interaction_actions", None) or []):
-                        els.append({
-                            "id": getattr(a, "id", None),
-                            "description": getattr(a, "description", "") or "",
-                            "type": type(a).__name__,
-                        })
-                    page = session.window.page if session.window else None
-                    return {"url": getattr(page, "url", ""),
-                            "title": (await page.title()) if page else "",
-                            "elements": els[:200], "element_count": len(els)}
-
-                if action == "scrape":
-                    md = await session.ascrape(only_main_content=params.get("only_main_content", True))
-                    page = session.window.page if session.window else None
-                    return {"url": getattr(page, "url", ""), "markdown": (md or "")[:50000]}
-
-                if action == "screenshot":
-                    out_dir = params.get("dir") or str(BASE / "screenshots")
-                    Path(out_dir).mkdir(parents=True, exist_ok=True)
-                    path = str(Path(out_dir) / f"browser_{int(time.time()*1000)}.png")
-                    data = await session.window.page.screenshot(full_page=params.get("full_page", False))
-                    Path(path).write_bytes(data)
-                    return {"screenshot": path}
-
-                # Everything else maps to a Notte execute action. Notte validates
-                # the type and params and returns a result with .success/.message.
-                exec_kwargs = {"type": action}
-                exec_kwargs.update({k: v for k, v in params.items() if v is not None})
-                result = await session.aexecute(**exec_kwargs)
+            if action == "observe":
+                obs = await session.aobserve()
+                els = []
+                space = getattr(obs, "space", None)
+                for a in (getattr(space, "interaction_actions", None) or []):
+                    els.append({
+                        "id": getattr(a, "id", None),
+                        "description": getattr(a, "description", "") or "",
+                        "type": type(a).__name__,
+                    })
                 page = session.window.page if session.window else None
-                return {
-                    "success": bool(getattr(result, "success", True)),
-                    "message": getattr(result, "message", "") or "",
-                    "url": getattr(page, "url", "") if page else "",
-                }
-            finally:
-                await self._save_state(session)
+                return {"url": getattr(page, "url", ""),
+                        "title": (await page.title()) if page else "",
+                        "elements": els[:200], "element_count": len(els)}
+
+            if action == "scrape":
+                md = await session.ascrape(only_main_content=params.get("only_main_content", True))
+                page = session.window.page if session.window else None
+                return {"url": getattr(page, "url", ""), "markdown": (md or "")[:50000]}
+
+            if action == "screenshot":
+                out_dir = params.get("dir") or str(BASE / "screenshots")
+                Path(out_dir).mkdir(parents=True, exist_ok=True)
+                path = str(Path(out_dir) / f"browser_{int(time.time()*1000)}.png")
+                data = await session.window.page.screenshot(full_page=params.get("full_page", False))
+                Path(path).write_bytes(data)
+                return {"screenshot": path}
+
+            # Everything else maps to a Notte execute action. Notte validates
+            # the type and params and returns a result with .success/.message.
+            exec_kwargs = {"type": action}
+            exec_kwargs.update({k: v for k, v in params.items() if v is not None})
+            result = await session.aexecute(**exec_kwargs)
+            page = session.window.page if session.window else None
+            return {
+                "success": bool(getattr(result, "success", True)),
+                "message": getattr(result, "message", "") or "",
+                "url": getattr(page, "url", "") if page else "",
+            }
 
     async def agent(self, task, url=None, max_steps=20):
         async with self._operation_lock:
             self._check_automation()
             session = await self._ensure()
             import notte
-            try:
-                if url:
-                    nav = await session.aexecute(type="goto", url=url)
-                    if not nav.success:
-                        return f"Error navigating to {url}: {nav.message}"
-                agent = notte.Agent(
-                    session=session,
-                    reasoning_model=f"openrouter/{BROWSER_AGENT_MODEL}",
-                    max_steps=max_steps,
-                )
-                response = await agent.arun(task=task)
-                result = str(response.answer) if hasattr(response, "answer") else str(response)
-                with contextlib.suppress(Exception):
-                    markdown = await session.ascrape(only_main_content=True)
-                    if markdown:
-                        result += f"\n\n--- Final page state (URL: {session.window.page.url}) ---\n{markdown[:50000]}"
-                return result
-            finally:
-                await self._save_state(session)
+            if url:
+                nav = await session.aexecute(type="goto", url=url)
+                if not nav.success:
+                    return f"Error navigating to {url}: {nav.message}"
+            agent = notte.Agent(
+                session=session,
+                reasoning_model=f"openrouter/{BROWSER_AGENT_MODEL}",
+                max_steps=max_steps,
+            )
+            response = await agent.arun(task=(task + "\n\nIf the task requires a manual login, MFA, or a challenge that needs the user, stop and report the current URL and what the user must do. The calling agent has a browser_session login tool to hand control to the user."))
+            result = str(response.answer) if hasattr(response, "answer") else str(response)
+            with contextlib.suppress(Exception):
+                markdown = await session.ascrape(only_main_content=True)
+                if markdown:
+                    result += f"\n\n--- Final page state (URL: {session.window.page.url}) ---\n{markdown[:50000]}"
+            return result
 
     async def close(self):
         async with self._operation_lock:
-            await self._close_session()
-            self._paused = False
+            await self._cancel_login()
+            try:
+                await self._close_session()
+            finally:
+                self._paused = False
+                if self._temporary_profile is not None:
+                    self._temporary_profile.cleanup()
+                    self._temporary_profile = None
+                    self._profile_dir = None
 
 # ═══════════════════════════════════════════════════════════════════
 # Notte SERP bridge — lets SearXNG fetch through a real browser
@@ -4270,8 +4397,9 @@ TOOLS = [
                 "mode='screenshot' waits for page/challenge settling, saves a PNG, and returns "
                 "challenge metadata; use analyze_image to interpret it. "
                 "mode='html' returns full rendered DOM. For complex multi-step interactions, use browser_agent. "
-                "If the page requires manual login or MFA, call browser_session(action='open', url=url) "
-                "to show it to the user, then ask for confirmation and wait before browser_session(action='resume')."
+                "If the page requires manual login or MFA, call browser_session(action='login', url=url). "
+                "The user completes the login and closes the login browser; dtt then continues headless "
+                "with the saved profile. Inspect the resumed page before assuming access succeeded."
             ),
             "parameters": {
                 "type": "object",
@@ -4851,9 +4979,10 @@ TOOLS = [
                 "browser actions. The agent uses Sonnet 4.6 for structured browser reasoning and Camoufox (stealth Firefox) "
                 "for browsing. Returns when the goal is achieved or it gives up. More expensive than "
                 "fetch_page; use only when interaction is required. Shares the saved session with fetch_page. "
-                "If login or MFA needs the user, call browser_session(action='open', url=login_url) "
-                "yourself. Ask the user to complete it and wait for confirmation before "
-                "browser_session(action='resume'), then continue the task. No startup flags are required."
+                "If login or MFA needs the user, call browser_session(action='login', url=login_url) "
+                "yourself. The user completes the login and closes the login browser; dtt then "
+                "continues headless with the saved profile. Inspect the resumed page before continuing. "
+                "No startup flags or confirmation question are required."
             ),
             "parameters": {
                 "type": "object",
@@ -4883,22 +5012,25 @@ TOOLS = [
             "description": (
                 "Manage the browser shared by fetch_page and browser_agent. "
                 "When a page requires manual login, MFA, or a challenge the user must handle, "
-                "call action='open' with its url yourself. This opens a visible window and pauses "
-                "browser automation without any startup flags. Then use request_user_input to ask "
-                "the user to complete the login and leave the window open. Wait for their confirmation "
-                "before calling action='resume'. Do not queue resume in advance or resume on a timeout. "
-                "Resume saves the current browser state and allows automation again; it does not verify login success. "
-                "Named sessions persist cookies, localStorage and IndexedDB across runs. "
-                "Changing headed mode restarts the browser and reloads the current URL. "
-                "Status reports the current session; close saves and closes it."
+                "call action='login' with its url yourself. It opens a visible browser and pauses "
+                "automation without startup flags. Tell the user to complete the login, then close "
+                "all windows of the login browser or quit that browser. The background handoff "
+                "restarts it headless with the saved profile. DTT waits automatically before its "
+                "next turn; do not ask a confirmation question or call resume for this flow. "
+                "Use action='wait' to wait up to timeout_seconds (default/max 30) for handoff completion; "
+                "repeat wait if still waiting instead of repeatedly polling status. Closure does not "
+                "prove login succeeded: inspect the resumed page. Named Firefox profiles preserve "
+                "cookies, localStorage and IndexedDB across runs. Status reports the session. "
+                "For intentional manual control, open pauses until resume; close closes the browser."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["status", "open", "resume", "close"]},
-                    "session": {"type": "string", "description": "Optional session name for open. Omit to keep the current session."},
-                    "headed": {"type": "boolean", "description": "Show the browser window. Open defaults to true; resume keeps the current mode unless set."},
-                    "url": {"type": "string", "description": "Optional URL to open for login."},
+                    "action": {"type": "string", "enum": ["login", "wait", "status", "open", "resume", "close"]},
+                    "session": {"type": "string", "description": "Optional session name for login or open. Omit to keep the current session."},
+                    "headed": {"type": "boolean", "description": "For manual open/resume only. Open defaults to true; resume keeps the current mode unless set. Login always opens headed and continues headless."},
+                    "url": {"type": "string", "description": "Optional URL for login or open."},
+                    "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 30, "default": 30, "description": "Maximum seconds for action=wait. A timeout leaves the handoff active."},
                     "result_mode": RESULT_MODE_PROP,
                 },
                 "required": ["action", "result_mode"],
@@ -5557,14 +5689,16 @@ navigating SPAs, clicking through menus, handling CAPTCHAs that auto-solving \
 can't handle. More expensive than fetch_page (uses Sonnet for each step). \
 DO NOT use for simple page reads.
 - browser_session: When a page or browser_agent reports that login, MFA, or a \
-challenge needs the user, call browser_session(action="open", url=login_url, \
-result_mode="raw") yourself. It opens a visible window and pauses browser \
-automation; no CLI flags or restart command are required. Then call \
-request_user_input to ask the user to complete the login and leave the window \
-open. Wait for their confirmation, then call browser_session(action="resume", \
-result_mode="raw") in a later turn and continue the task. Never queue resume \
-before the user's reply or resume after a timeout. Resume saves browser state; \
-it does not establish that login succeeded. Use status to inspect the session.
+challenge needs the user, call browser_session(action="login", url=login_url, \
+result_mode="raw") yourself. It opens a visible browser and pauses automation \
+without CLI flags. Tell the user to complete the login, then close all windows \
+of the login browser or quit it. DTT waits automatically, then restarts headless \
+with the saved Firefox profile and continues. Do not ask a confirmation question \
+or call resume for this flow. If you need to wait explicitly, use \
+browser_session(action="wait", timeout_seconds=30, result_mode="raw"); repeat \
+wait if still waiting rather than repeatedly calling status. Closure does not \
+prove authentication succeeded: inspect the resumed page before continuing. \
+Use open/resume only when you intentionally need manual control of the pause.
 - glob: use ** for recursive. Returns file metadata (size, count).
 - http_request: use for REST APIs, JSON endpoints, file downloads, POST \
 requests — NOT for human-readable web pages (use fetch_page for those).
@@ -5858,8 +5992,8 @@ background-job log files), TWOCAPTCHA_API_KEY (if set), OPENROUTER_API_KEY
 
 For a task requiring form interaction:
   1. Use fetch_page to read the page first
-  2. If manual login is required, use browser_session open and request_user_input.
-     Wait for the user's confirmation before browser_session resume.
+  2. If manual login is required, call browser_session with action="login".
+     The user completes login and closes that browser; DTT continues headless.
   3. Use browser_agent to fill forms or click through flows with the same login.
   4. browser_agent returns the final page state when done
 
@@ -5980,14 +6114,16 @@ can and finalize with status='partial' explaining what remains.
 
 <browser_login>
 If a page or browser_agent reports that login, MFA, or a challenge needs the \
-user, call browser_session(action="open", url=login_url, result_mode="raw") \
-yourself. This opens a visible window and pauses browser automation without \
-startup flags. Call request_user_input to ask the user to complete the login \
-and leave the window open. Wait for their confirmation, then call \
-browser_session(action="resume", result_mode="raw") in a later turn. Do not \
-queue resume before confirmation or resume after a timeout. Resume saves \
-browser state; it does not verify login success. Continue with fetch_page \
-mode="markdown" or browser_agent, which share the same session.
+user, call browser_session(action="login", url=login_url, result_mode="raw") \
+yourself. It opens a visible browser and pauses automation without startup \
+flags. Tell the user to complete the login, then close all windows of that \
+browser or quit it. DTT waits automatically and restarts headless with the \
+saved profile. Do not ask a confirmation question or call resume for this flow. \
+If an explicit wait is needed, call browser_session(action="wait", \
+timeout_seconds=30, result_mode="raw"), repeating wait while still waiting \
+instead of polling status. Closure does not prove authentication succeeded. \
+Inspect the resumed page with fetch_page mode="markdown" or browser_agent, \
+which share the same session, then continue the task.
 </browser_login>
 
 <quick_examples>
@@ -7759,9 +7895,13 @@ class Agent:
             f"Successful: {len(items) - errors[0]}, Errors: {errors[0]}"
         )
 
-    async def _tool_browser_session(self, action, session=None, headed=None, url=None, **kw):
+    async def _tool_browser_session(self, action, session=None, headed=None, url=None, timeout_seconds=30, **kw):
         try:
-            result = await self.browser.control(action, session=session, headed=headed, url=url)
+            result = await self.browser.control(action, session=session, headed=headed, url=url, timeout_seconds=timeout_seconds)
+            if action == "login" and not getattr(self, "_mcp_mode", False):
+                self.spinner.stop()
+                print("\nComplete the login in the browser, then close its windows or quit it. DTT will continue automatically.", file=sys.stderr)
+                self.events.emit("status", phase="waiting_for_user", detail="Complete the login, then close the login browser.")
             return json.dumps(result, indent=2)
         finally:
             self.headed = not self.browser._headless
@@ -7769,6 +7909,27 @@ class Agent:
                 meta = self.thread_logger.load_meta() or {}
                 meta.update(browser_session=self.browser.session_name, headed=self.headed)
                 self.thread_logger.save_meta(meta)
+
+    async def _await_browser_login(self, tool_calls, results):
+        login_results = []
+        for call, result in zip(tool_calls, results):
+            if call["function"]["name"] != "browser_session":
+                continue
+            try:
+                arguments = call["function"].get("arguments") or {}
+                if isinstance(arguments, str):
+                    arguments = json.loads(arguments)
+                if arguments.get("action") == "login":
+                    login_results.append(result)
+            except (ValueError, AttributeError):
+                continue
+        if not login_results or self.browser._login_task is None:
+            return
+        await asyncio.shield(self.browser._login_task)
+        state = await self._tool_browser_session("status")
+        for result in login_results:
+            result["content"] += "\n\nBrowser login handoff state:\n" + state
+        self.events.emit("status", phase="running", detail="Browser login handoff finished.")
 
     async def _tool_browser_agent(self, task, url=None, max_steps=20, **kw):
         self._browser_agent_used = True
@@ -8861,8 +9022,9 @@ class Agent:
             else "(unavailable)"
         )
         if self.thread_logger and self.browser.session_name is None:
-            self.browser.set_state_file(
-                self.thread_logger.cache_dir / "browser_storage.json",
+            self.browser.set_profile(
+                self.thread_logger.cache_dir / "browser-profile",
+                legacy_state_file=self.thread_logger.cache_dir / "browser_storage.json",
                 legacy_cookie_file=self.thread_logger.cache_dir / "browser_cookies.json",
             )
         self._base_system_prompt = (QUICK_SYSTEM_PROMPT if self.quick else SYSTEM_PROMPT).format(
@@ -9127,6 +9289,7 @@ class Agent:
                 # Execute the non-finalize tools normally (don't waste them)
                 self.spinner.start("Executing tools…")
                 results = await self._execute_tools(non_fin)
+                await self._await_browser_login(non_fin, results)
                 self.spinner.stop()
                 for r in results:
                     self.messages.append(r)
@@ -9149,6 +9312,7 @@ class Agent:
 
             self.spinner.start("Executing tools…")
             results = await self._execute_tools(tool_calls)
+            await self._await_browser_login(tool_calls, results)
             self.spinner.stop()
 
             for r in results:
@@ -10452,9 +10616,10 @@ def _browser_mcp_tools(types):
                 "through the browser. Use markdown for pages that require a login. mode='screenshot' saves a "
                 "PNG and returns its path. Browser modes share the saved session "
                 "with dtt_browser and dtt_browser_agent. If the page requires "
-                "manual login or MFA, call dtt_browser_session(action='open', url=url), "
-                "ask the user through your client's user-input path, wait for "
-                "confirmation, then call dtt_browser_session(action='resume')."
+                "manual login or MFA, call dtt_browser_session(action='login', url=url). "
+                "Tell the user to complete login and close the login browser. Use "
+                "dtt_browser_session(action='wait') until the headless browser is ready, "
+                "then inspect the resumed page. No confirmation question is required."
             ),
             inputSchema={
                 "type": "object",
@@ -10475,9 +10640,10 @@ def _browser_mcp_tools(types):
                 "(→ page markdown), screenshot (→ PNG path). The session persists "
                 "across calls, and saved logins carry over after restart. Uses "
                 "the same session as dtt_fetch and dtt_browser_agent. When login "
-                "or MFA needs the user, call dtt_browser_session(action='open', url=login_url) "
-                "yourself. Ask through your client's user-input path and wait "
-                "for confirmation before dtt_browser_session(action='resume')."
+                "or MFA needs the user, call dtt_browser_session(action='login', url=login_url) "
+                "yourself. Tell the user to complete login and close the login browser. "
+                "Use dtt_browser_session(action='wait') until it restarts headless, "
+                "then inspect the resumed page. No confirmation question is required."
             ),
             inputSchema={
                 "type": "object",
@@ -10496,26 +10662,28 @@ def _browser_mcp_tools(types):
             name="dtt_browser_session",
             description=(
                 "When a page requires manual login, MFA, or a challenge the user "
-                "must handle, call action='open' with its url yourself. It pauses "
-                "browser automation and opens a visible window without startup "
-                "flags (headed defaults to true). Ask the user through your "
-                "client's user-input path to complete the login and leave the "
-                "window open. Wait for their confirmation before calling "
-                "action='resume'. Do not queue resume in advance or resume on a "
-                "timeout. Resume saves browser state and allows automation; "
-                "it does not verify login success. action='status' reports the "
-                "session name, display mode, and handoff state. action='close' saves and closes "
-                "the browser. The session stores cookies, localStorage, and "
-                "IndexedDB for reuse across runs. Changing display mode "
-                "restarts the browser and reloads the current URL."
+                "must handle, call action='login' with its url yourself. It starts "
+                "a background handoff, opens a visible browser, and pauses automation "
+                "without startup flags. Tell the user to complete login and close "
+                "all windows of the login browser or quit it. The handoff then "
+                "restarts headless with the saved Firefox profile. Call action='wait' "
+                "to wait up to timeout_seconds (default/max 30) for completion; repeat "
+                "wait if still waiting instead of repeatedly polling status. A wait "
+                "timeout leaves the handoff active. Do not ask a confirmation "
+                "question or call resume for this flow. Closure does not prove login "
+                "succeeded: inspect the resumed page. Status reports session and "
+                "handoff state. Profiles persist cookies, localStorage and IndexedDB. "
+                "For intentional manual control, open pauses until resume; close "
+                "closes the browser."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["status", "open", "resume", "close"]},
-                    "session": {"type": "string", "description": "optional saved session name for open"},
-                    "headed": {"type": "boolean", "description": "show the window; open defaults to true; resume keeps the current mode unless set"},
-                    "url": {"type": "string", "description": "optional URL for open"},
+                    "action": {"type": "string", "enum": ["login", "wait", "status", "open", "resume", "close"]},
+                    "session": {"type": "string", "description": "optional saved session name for login or open"},
+                    "headed": {"type": "boolean", "description": "for manual open/resume only; open defaults to true, resume keeps the current mode unless set; login always opens headed and continues headless"},
+                    "url": {"type": "string", "description": "optional URL for login or open"},
+                    "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 30, "default": 30, "description": "maximum seconds for action=wait; a timeout leaves the handoff active"},
                 },
                 "required": ["action"],
                 "additionalProperties": False,
@@ -10529,9 +10697,10 @@ def _browser_mcp_tools(types):
                 "multi-step interactions, then returns the result "
                 "plus the final page. It shares the saved browser session with "
                 "dtt_fetch and dtt_browser. If login or MFA needs the user, "
-                "call dtt_browser_session(action='open', url=login_url) yourself. "
-                "Ask through your client's user-input path and wait for confirmation "
-                "before dtt_browser_session(action='resume'), then continue the task. "
+                "call dtt_browser_session(action='login', url=login_url) yourself. "
+                "Tell the user to complete login and close the login browser. "
+                "Use dtt_browser_session(action='wait') until it restarts headless, "
+                "then inspect the resumed page. No confirmation question is required. "
                 "No startup flags are required for this handoff. Its reasoning model requires "
                 "OPENROUTER_API_KEY; the other browser tools do not."
             ),
@@ -10624,7 +10793,8 @@ async def run_browser_mcp(browser_session="default", headed=False):
         if name == "dtt_browser_session":
             return await agent._tool_browser_session(
                 a.get("action"), session=a.get("session"),
-                headed=a.get("headed"), url=a.get("url"))
+                headed=a.get("headed"), url=a.get("url"),
+                timeout_seconds=a.get("timeout_seconds", 30))
         if name == "dtt_browser_agent":
             if not api_key:
                 raise RuntimeError(

@@ -105,13 +105,13 @@ Everything else is installed automatically into `/tmp/dothething` on first run.
 
 DTT and MCP client agents can open a browser when a login or MFA step needs your input. The tools handle this without `--headed` or other startup flags:
 
-1. DTT calls `browser_session(action="open", url="https://github.com/login", result_mode="raw")`. An MCP client calls `dtt_browser_session({"action":"open","url":"https://github.com/login"})`. Either tool opens a visible window and pauses browser automation.
-2. DTT asks you to complete the login through `request_user_input`; an MCP client uses its own user-input path. Leave the window open, then confirm when you are done. The agent waits for your reply.
-3. After your confirmation, DTT calls `browser_session(action="resume", result_mode="raw")`. An MCP client calls `dtt_browser_session({"action":"resume"})`. This saves the browser state and lets the agent continue its task with the same session.
+1. DTT calls `browser_session(action="login", url="https://github.com/login", result_mode="raw")`. An MCP client calls `dtt_browser_session({"action":"login","url":"https://github.com/login"})`. Either tool opens a visible browser and pauses automation.
+2. Complete the login, including any MFA step. Close all windows of the login browser or quit that browser when you are done.
+3. DTT restarts the browser headless with the saved profile and continues the task. It needs no confirmation message from you. An MCP client waits with `dtt_browser_session({"action":"wait","timeout_seconds":30})` and continues when the browser is ready.
 
-The agent must identify that a manual login is needed and use this sequence. The session tool does not detect login requirements or verify that the login succeeded.
+The agent identifies that a manual login is needed and calls the tool. Closing the browser signals that you are done; the agent still needs to inspect the resumed page to check its access.
 
-To reuse logins across separate tasks, add `session="work"` to DTT's open call or `"session":"work"` to the MCP call. You can also select a named session on the command line:
+To reuse logins across separate tasks, add `session="work"` to DTT's login call or `"session":"work"` to the MCP call. You can also select a named session on the command line:
 
 ```bash
 dtt --browser-session work "List my repositories. Open the browser for me if I need to log in."
@@ -124,7 +124,7 @@ Without a name, each thread keeps its own browser state, which `--resume` restor
 
 Page fetches and the autonomous browser agent use the same browser session. The MCP browser tools share it too. Fetch mode `text` starts with a separate HTTP request without saved browser logins and can retry through the browser if the request is blocked. Use mode `markdown` for pages that require your login. The search bridge has its own headless browsers.
 
-Named sessions save cookies, localStorage, and IndexedDB in `~/.dtt/browser-sessions/NAME/storage.json`. These files contain login credentials; dtt restricts file access to your account. This is a storage snapshot, so it does not restore open tabs, sessionStorage, or unfinished forms after a restart. Changing the display mode of an open browser restarts it and reloads the current URL. Some sites can still require a fresh login.
+Named sessions use a Firefox profile in `~/.dtt/browser-sessions/NAME/profile`. Firefox saves cookies, including session cookies, along with localStorage and IndexedDB when you quit the login browser. These files contain login credentials; dtt restricts profile access to your account. DTT migrates earlier browser snapshots and thread cookie files on first use. Changing the display mode of an open browser restarts it and reloads the current URL. Sites can expire logins or require a fresh login.
 
 Only one process can use a named session at a time. A second process reports that the session is in use; close the first browser session before retrying. Orchestrator workers inherit the selected name and display mode, so workers that share a name must take turns with the browser.
 
@@ -145,13 +145,15 @@ Add dtt to your MCP client's configuration. Use an absolute path to the installe
 
 MCP mode uses the saved session `default` unless you supply a name through the flag or environment. Omit `--headed` for headless startup; the client can open a window later with `dtt_browser_session`.
 
-For a manual login, the client calls these tools in order, with the user's confirmation between steps 1 and 2:
+For a manual login, the client uses this sequence:
 
-1. `dtt_browser_session({"action":"open","url":"https://github.com/login"})` opens a visible window and pauses browser automation. Add `"session":"work"` to select another saved session.
-2. `dtt_browser_session({"action":"resume"})` saves the login and resumes automation. Add `"headed":false` to continue headless.
-3. `dtt_browser({"action":"goto","url":"https://github.com/settings/profile"})` uses the login. `dtt_fetch` and `dtt_browser_agent` use the same session.
+1. `dtt_browser_session({"action":"login","url":"https://github.com/login"})` starts the handoff and opens a visible browser. Add `"session":"work"` to select another saved profile. Tell the user to complete login, then close all windows of that browser or quit it.
+2. `dtt_browser_session({"action":"wait","timeout_seconds":30})` waits for the handoff to finish. Repeat `wait` if the result still says the handoff is active. Each call waits up to 30 seconds; its timeout does not cancel the login. Use `wait` rather than repeated `status` calls.
+3. Once the browser is ready, `dtt_browser({"action":"goto","url":"https://github.com/settings/profile"})` checks access with the saved login. `dtt_fetch` and `dtt_browser_agent` use the same profile. Continue the task after you inspect the page.
 
-Call `dtt_browser_session({"action":"status"})` to inspect the current session, or `dtt_browser_session({"action":"close"})` to save it and close the browser. Search, fetch, browser steps, and session control need no OpenRouter key in MCP mode. Only `dtt_browser_agent` requires `OPENROUTER_API_KEY`.
+Call `dtt_browser_session({"action":"status"})` to inspect the current session, or `dtt_browser_session({"action":"close"})` to close it. The `open` and `resume` actions remain available when a client needs direct control of the pause; the login flow uses `login` and `wait`.
+
+Search, fetch, browser steps, and session control need no OpenRouter key in MCP mode. Only `dtt_browser_agent` requires `OPENROUTER_API_KEY`.
 
 ## How it works
 
@@ -324,7 +326,7 @@ All variables can be saved to `~/.dtt/env` (shell-exported values take precedenc
 | `~/.dtt/env` | Saved API keys for OpenRouter, Serper, 2Captcha, and AgentMail. Mode 0600. The agent can update this via manage_config. |
 | `~/.dtt/threads/` | Saved conversation threads (resume with `--resume`) |
 | `~/.dtt/threads/<id>/cache/` | Per-thread scratch folder (intermediate files, downloads, batch artifacts) |
-| `~/.dtt/browser-sessions/<name>/storage.json` | Saved browser cookies, localStorage, and IndexedDB for a named session |
+| `~/.dtt/browser-sessions/<name>/profile/` | Firefox profile with saved cookies, localStorage, and IndexedDB for a named session |
 | `~/.dtt/skills/<name>/SKILL.md` | User-defined skills (Claude Code convention) |
 | `~/.dtt/mcp.json` | MCP server configuration |
 | `/tmp/dothething/` | Runtime: Python venv, SearXNG, Camoufox browser |

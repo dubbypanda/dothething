@@ -66,15 +66,47 @@ def load_browser_code():
     return namespace
 
 
-class FakeContext:
+class FakeEvents:
     def __init__(self):
+        self.listeners = {}
+
+    def on(self, event, callback):
+        self.listeners.setdefault(event, []).append(callback)
+
+    def remove_listener(self, event, callback):
+        if callback in self.listeners.get(event, []):
+            self.listeners[event].remove(callback)
+
+    def emit(self, event, *args):
+        for callback in list(self.listeners.get(event, [])):
+            result = callback(*args)
+            if asyncio.iscoroutine(result):
+                asyncio.create_task(result)
+
+
+class FakeContext(FakeEvents):
+    def __init__(self, profile_dir=None):
+        super().__init__()
+        self.profile_dir = Path(profile_dir) if profile_dir else None
         self.state = {"cookies": [], "origins": []}
+        if self.profile_dir:
+            self.profile_dir.mkdir(parents=True, exist_ok=True)
+            saved = self.profile_dir / "fake-native-state.json"
+            if saved.exists():
+                self.state = json.loads(saved.read_text())
         self.restores = []
         self.snapshots = []
         self.pages = []
-        self.browser = types.SimpleNamespace(is_connected=lambda: True)
+        self.closed = False
+        self.browser = FakeEvents()
+        self.browser.is_connected = lambda: not self.closed
+
+    def is_closed(self):
+        return self.closed
 
     async def storage_state(self, *, indexed_db=False):
+        if self.closed:
+            raise RuntimeError("Browser context is closed")
         self.snapshots.append(indexed_db)
         return copy.deepcopy(self.state)
 
@@ -90,13 +122,31 @@ class FakeContext:
     async def add_cookies(self, cookies):
         self.state["cookies"] = copy.deepcopy(cookies)
 
+    async def new_page(self):
+        page = FakePage(self)
+        self.emit("page", page)
+        return page
 
-class FakePage:
+    async def close(self):
+        if self.closed:
+            return
+        if self.profile_dir:
+            (self.profile_dir / "fake-native-state.json").write_text(json.dumps(self.state))
+        self.closed = True
+        for page in list(self.pages):
+            await page.close()
+        self.emit("close", self)
+        self.browser.emit("disconnected", self.browser)
+
+
+class FakePage(FakeEvents):
     def __init__(self, context):
+        super().__init__()
         self.context = context
         self.url = "about:blank"
         self.closed = False
         self.front_count = 0
+        self.main_frame = object()
         context.pages.append(self)
 
     def is_closed(self):
@@ -110,15 +160,24 @@ class FakePage:
 
     async def goto(self, url, **kwargs):
         self.url = url
+        self.emit("framenavigated", self.main_frame)
+
+    async def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        self.context.pages.remove(self)
+        self.emit("close", self)
 
 
 class FakeSession:
     instances = []
     fail_next_start = False
+    fail_next_close = False
 
-    def __init__(self, **kwargs):
+    def __init__(self, *, profile_dir=None, **kwargs):
         self.options = kwargs
-        self.context = FakeContext()
+        self.context = FakeContext(profile_dir)
         self.window = types.SimpleNamespace(page=FakePage(self.context))
         self.enter_count = 0
         self.exit_count = 0
@@ -135,12 +194,15 @@ class FakeSession:
 
     async def __aexit__(self, *args):
         self.exit_count += 1
-        self.window.page.closed = True
+        if self.__class__.fail_next_close:
+            self.__class__.fail_next_close = False
+            raise RuntimeError("test native close failure")
+        await self.context.close()
 
     async def aexecute(self, **kwargs):
         self.executions.append(kwargs)
         if kwargs["type"] == "goto":
-            self.window.page.url = kwargs["url"]
+            await self.window.page.goto(kwargs["url"])
         return types.SimpleNamespace(success=True, message="")
 
     async def aobserve(self):
@@ -194,7 +256,7 @@ class BrowserSessionTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="dtt-browser-tests-")
         self.root = Path(self.temp.name)
-        self.path = self.root / "storage.json"
+        self.profile = self.root / "profile"
         self.home_patch = patch.object(Path, "home", return_value=self.root)
         self.home_patch.start()
         self.env_patch = patch.dict(os.environ, {"DTT_BROWSER_SESSION": ""})
@@ -202,16 +264,24 @@ class BrowserSessionTests(unittest.IsolatedAsyncioTestCase):
         self.code["BASE"] = self.root
         FakeSession.instances = []
         FakeSession.fail_next_start = False
+        FakeSession.fail_next_close = False
         FakeAgent.sessions = []
-        self.notte_patch = patch.dict(sys.modules, {"notte": types.SimpleNamespace(
-            Session=FakeSession, Agent=FakeAgent,
-        )})
+        self.notte_patch = patch.dict(sys.modules, {"notte": types.SimpleNamespace(Agent=FakeAgent)})
         self.notte_patch.start()
+
+        async def start_session(browser):
+            session = FakeSession(profile_dir=browser._profile_dir, headless=browser._headless)
+            await session.__aenter__()
+            return session
+
+        self.start_patch = patch.object(self.Browser, "_start_session", new=start_session)
+        self.start_patch.start()
         self.browsers = []
 
     async def asyncTearDown(self):
         for browser in self.browsers:
             await browser.close()
+        self.start_patch.stop()
         self.notte_patch.stop()
         self.env_patch.stop()
         self.home_patch.stop()
@@ -222,115 +292,244 @@ class BrowserSessionTests(unittest.IsolatedAsyncioTestCase):
         self.browsers.append(browser)
         return browser
 
-    async def test_restores_full_state_once_and_retains_live_changes(self):
-        self.path.write_text(json.dumps(login_state()))
-        browser = self.browser(state_file=self.path)
-        session = await browser._ensure()
-        self.assertEqual(session.context.state, login_state())
-        session.context.state["origins"][0]["localStorage"][0]["value"] = "new-account"
-        await browser.act("observe")
-        await browser.act("observe")
-        self.assertEqual(len(session.context.restores), 1)
-        self.assertEqual(session.context.state["origins"][0]["localStorage"][0]["value"], "new-account")
-        self.assertTrue(session.context.snapshots)
-        self.assertTrue(all(session.context.snapshots))
+    async def wait_ready(self, browser):
+        status = await asyncio.wait_for(browser.control("wait", timeout_seconds=1), timeout=2)
+        self.assertEqual(status["login_state"], "ready", status)
+        self.assertFalse(status["headed"])
+        self.assertFalse(status["paused"])
+        return status
 
-    async def test_logout_replaces_saved_state_without_old_cookies(self):
-        self.path.write_text(json.dumps(login_state()))
-        browser = self.browser(state_file=self.path)
+    async def test_native_profile_preserves_login_after_last_tool_call(self):
+        browser = self.browser(profile_dir=self.profile)
         session = await browser._ensure()
-        session.context.state = {"cookies": [], "origins": []}
         await browser.act("observe")
+        session.context.state = login_state()
         await browser.close()
-        restored = await self.browser(state_file=self.path)._ensure()
-        self.assertEqual(restored.context.state, {"cookies": [], "origins": []})
+        restored = await self.browser(profile_dir=self.profile)._ensure()
+        self.assertEqual(restored.context.state, login_state())
+        self.assertEqual(session.context.snapshots, [])
+        self.assertEqual(restored.context.restores, [])
 
-    async def test_close_captures_login_after_last_tool_call(self):
-        browser = self.browser(state_file=self.path)
+    async def test_logout_stays_deleted_after_profile_reopen(self):
+        browser = self.browser(profile_dir=self.profile)
         session = await browser._ensure()
         session.context.state = login_state()
         await browser.close()
-        restored = await self.browser(state_file=self.path)._ensure()
-        self.assertEqual(restored.context.state, login_state())
-        self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
+        second = self.browser(profile_dir=self.profile)
+        restored = await second._ensure()
+        restored.context.state = {"cookies": [], "origins": []}
+        await second.close()
+        final = await self.browser(profile_dir=self.profile)._ensure()
+        self.assertEqual(final.context.state, {"cookies": [], "origins": []})
 
-    async def test_manual_open_restarts_headed_and_pauses_until_resume(self):
-        browser = self.browser(state_file=self.path)
-        original = await browser._ensure()
-        original.window.page.url = "https://example.test/account"
-        original.context.state = login_state()
-        await browser.control("open")
+    async def test_login_opens_headed_and_quit_restarts_headless_with_authentication(self):
+        browser = self.browser(profile_dir=self.profile)
+        await browser.act("goto", url="https://example.test/account")
+        original = FakeSession.instances[-1]
+        result = await browser.control("login")
         shown = FakeSession.instances[-1]
         self.assertIsNot(shown, original)
         self.assertFalse(shown.options["headless"])
+        self.assertEqual(result["login_state"], "waiting_for_close")
         self.assertEqual(shown.window.page.url, "https://example.test/account")
-        self.assertEqual(shown.context.state, login_state())
-        paused_calls = (
+        shown.context.state = login_state()
+        await shown.context.close()
+        result = await self.wait_ready(browser)
+        self.assertEqual(result["url"], "https://example.test/account")
+        resumed = FakeSession.instances[-1]
+        self.assertIsNot(resumed, shown)
+        self.assertEqual(resumed.context.state, login_state())
+        await browser.act("observe")
+        self.assertEqual(resumed.observe_count, 1)
+
+    async def test_login_waits_until_every_window_closes(self):
+        browser = self.browser(profile_dir=self.profile)
+        await browser.control("login", url="https://example.test/account")
+        shown = FakeSession.instances[-1]
+        another_page = await shown.context.new_page()
+        await another_page.goto("https://example.test/dashboard")
+        shown.context.state = login_state()
+        await shown.window.page.close()
+        await asyncio.sleep(0)
+        status = await browser.control("status")
+        self.assertEqual(status["login_state"], "waiting_for_close")
+        self.assertTrue(status["open"])
+        self.assertEqual(status["url"], "https://example.test/dashboard")
+        self.assertIs(FakeSession.instances[-1], shown)
+        await another_page.close()
+        result = await self.wait_ready(browser)
+        self.assertEqual(result["url"], "https://example.test/dashboard")
+        self.assertEqual(FakeSession.instances[-1].context.state, login_state())
+
+    async def test_profile_lock_remains_held_through_automatic_restart(self):
+        browser = self.browser(profile_dir=self.profile)
+        await browser.control("login", url="https://example.test/account")
+        shown = FakeSession.instances[-1]
+        closing = asyncio.Event()
+        release = asyncio.Event()
+        original = shown.__aexit__
+
+        async def delayed_close(*args):
+            closing.set()
+            await release.wait()
+            await original(*args)
+
+        shown.__aexit__ = delayed_close
+        await shown.context.close()
+        await asyncio.wait_for(closing.wait(), timeout=1)
+        competitor = self.browser(profile_dir=self.profile)
+        try:
+            with self.assertRaisesRegex(RuntimeError, "(?i)(use|lock|open)"):
+                await competitor._ensure()
+        finally:
+            release.set()
+        await self.wait_ready(browser)
+
+    async def test_wait_timeout_keeps_the_login_monitor_active(self):
+        browser = self.browser(profile_dir=self.profile)
+        await browser.control("login", url="https://example.test/account")
+        shown = FakeSession.instances[-1]
+        status = await browser.control("wait", timeout_seconds=1)
+        self.assertEqual(status["login_state"], "waiting_for_close")
+        shown.context.state = login_state()
+        await shown.context.close()
+        await self.wait_ready(browser)
+
+    async def test_close_cancels_login_without_an_unwanted_restart(self):
+        browser = self.browser(profile_dir=self.profile)
+        await browser.control("login", url="https://example.test/account")
+        count = len(FakeSession.instances)
+        shown = FakeSession.instances[-1]
+        await browser.control("close")
+        await shown.context.close()
+        await asyncio.sleep(0)
+        self.assertEqual(len(FakeSession.instances), count)
+        self.assertFalse((await browser.control("status"))["open"])
+
+    async def test_explicit_close_does_not_cancel_a_concurrent_wait_caller(self):
+        browser = self.browser(profile_dir=self.profile)
+        await browser.control("login", url="https://example.test/account")
+        waiter = asyncio.create_task(browser.control("wait", timeout_seconds=30))
+        await asyncio.sleep(0)
+        await browser.control("close")
+        status = await asyncio.wait_for(waiter, timeout=1)
+        self.assertIsInstance(status, dict)
+        self.assertFalse(waiter.cancelled())
+        self.assertFalse((await browser.control("status"))["open"])
+
+    async def test_wait_caller_cancellation_keeps_the_login_monitor_active(self):
+        browser = self.browser(profile_dir=self.profile)
+        await browser.control("login", url="https://example.test/account")
+        waiter = asyncio.create_task(browser.control("wait", timeout_seconds=30))
+        await asyncio.sleep(0)
+        waiter.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await waiter
+        shown = FakeSession.instances[-1]
+        shown.context.state = login_state()
+        await shown.context.close()
+        await self.wait_ready(browser)
+
+    async def test_close_during_login_setup_cancels_the_new_monitor(self):
+        browser = self.browser(profile_dir=self.profile)
+        started = asyncio.Event()
+        release = asyncio.Event()
+        original_execute = FakeSession.aexecute
+
+        async def delayed_navigation(session, **kwargs):
+            started.set()
+            await release.wait()
+            return await original_execute(session, **kwargs)
+
+        with patch.object(FakeSession, "aexecute", new=delayed_navigation):
+            login = asyncio.create_task(browser.control("login", url="https://example.test/account"))
+            await asyncio.wait_for(started.wait(), timeout=1)
+            close = asyncio.create_task(browser.control("close"))
+            try:
+                await asyncio.sleep(0)
+                self.assertFalse(close.done())
+            finally:
+                release.set()
+            await asyncio.wait_for(asyncio.gather(login, close), timeout=1)
+        for _ in range(3):
+            await asyncio.sleep(0)
+        self.assertEqual(len(FakeSession.instances), 1)
+        self.assertFalse((await browser.control("status"))["open"])
+        self.assertIsNone(browser._login_task)
+
+    async def test_named_selection_survives_close_after_a_temporary_profile(self):
+        browser = self.browser()
+        temporary = await browser._ensure()
+        expected = self.root / ".dtt" / "browser-sessions" / "work" / "profile"
+        self.assertNotEqual(temporary.context.profile_dir, expected)
+        await browser.control("open", session="work", url="https://example.test/account")
+        named = FakeSession.instances[-1]
+        named.context.state = login_state()
+        await browser.close()
+        closed = await browser.control("status")
+        self.assertEqual(closed["session"], "work")
+        self.assertEqual(closed["profile_dir"], str(expected))
+        reopened = await browser._ensure()
+        self.assertEqual(reopened.context.profile_dir, expected)
+        self.assertEqual(reopened.context.state, login_state())
+
+    async def test_restart_failure_reports_error_and_releases_profile_lock(self):
+        browser = self.browser(profile_dir=self.profile)
+        await browser.control("login", url="https://example.test/account")
+        shown = FakeSession.instances[-1]
+        shown.context.state = login_state()
+        FakeSession.fail_next_start = True
+        await shown.context.close()
+        status = await browser.control("wait", timeout_seconds=1)
+        self.assertEqual(status["login_state"], "failed", status)
+        self.assertIn("launch failure", status["login_error"])
+        restored = await self.browser(profile_dir=self.profile)._ensure()
+        self.assertEqual(restored.context.state, login_state())
+
+    async def test_automation_stays_paused_during_user_login(self):
+        browser = self.browser(profile_dir=self.profile)
+        await browser.control("login", url="https://example.test/account")
+        shown = FakeSession.instances[-1]
+        calls = (
             lambda: browser.act("observe"),
             lambda: browser.fetch("https://example.test/other"),
-            lambda: browser.agent("Check the account", url=None, max_steps=3),
+            lambda: browser.agent("Check the account", max_steps=3),
         )
-        for call in paused_calls:
-            try:
-                result = await call()
-            except RuntimeError as error:
-                result = str(error)
-            self.assertIn("resume", str(result).lower())
+        for call in calls:
+            with self.subTest(call=call):
+                try:
+                    result = await call()
+                except RuntimeError as error:
+                    result = str(error)
+                self.assertIn("waiting_for_close", str(result).lower())
         self.assertEqual(shown.observe_count, 0)
         self.assertEqual(FakeAgent.sessions, [])
-        shown.context.state["cookies"] = [cookie("manual-login")]
-        await browser.control("resume")
-        await browser.act("observe")
-        self.assertEqual(shown.observe_count, 1)
-        await browser.close()
-        restored = await self.browser(state_file=self.path)._ensure()
-        self.assertEqual(restored.context.state["cookies"], [cookie("manual-login")])
 
-    async def test_failed_start_can_retry(self):
-        browser = self.browser(state_file=self.path)
-        FakeSession.fail_next_start = True
-        with self.assertRaisesRegex(RuntimeError, "launch failure"):
-            await browser._ensure()
-        session = await browser._ensure()
-        self.assertEqual(session.enter_count, 1)
-        self.assertEqual(len(FakeSession.instances), 2)
-        await browser.act("observe")
-        self.assertEqual(session.observe_count, 1)
-
-    async def test_resume_headless_retains_authentication_and_current_url(self):
-        for persisted in (True, False):
-            with self.subTest(persisted=persisted):
-                browser = self.browser(state_file=self.path if persisted else None)
-                await browser.control("open", url="https://example.test/account")
-                shown = FakeSession.instances[-1]
-                shown.context.state = login_state()
-                result = await browser.control("resume", headed=False)
-                resumed = FakeSession.instances[-1]
-                self.assertIsNot(resumed, shown)
-                self.assertTrue(resumed.options["headless"])
-                self.assertFalse(result["paused"])
-                self.assertFalse(result["headed"])
-                self.assertEqual(resumed.window.page.url, "https://example.test/account")
-                self.assertEqual(resumed.context.state, login_state())
-                await browser.act("observe")
-                self.assertEqual(resumed.observe_count, 1)
-                await browser.close()
+    async def test_resume_headless_preserves_authentication_and_current_url(self):
+        browser = self.browser(profile_dir=self.profile)
+        await browser.control("open", url="https://example.test/account")
+        shown = FakeSession.instances[-1]
+        shown.context.state = login_state()
+        result = await browser.control("resume", headed=False)
+        resumed = FakeSession.instances[-1]
+        self.assertIsNot(resumed, shown)
+        self.assertTrue(resumed.options["headless"])
+        self.assertFalse(result["paused"])
+        self.assertEqual(resumed.window.page.url, "https://example.test/account")
+        self.assertEqual(resumed.context.state, login_state())
 
     async def test_invalid_control_arguments_leave_live_session_unchanged(self):
-        browser = self.browser(state_file=self.path)
+        browser = self.browser(profile_dir=self.profile)
         await browser.control("open", url="https://example.test/account")
         shown = FakeSession.instances[-1]
         shown.context.state = login_state()
         before = await browser.control("status")
         invalid_calls = (
-            ("unknown", {}),
-            ("status", {"headed": False}),
-            ("close", {"headed": False}),
-            ("close", {"session": "other"}),
-            ("resume", {"session": "other"}),
+            ("unknown", {}), ("status", {"headed": False}),
+            ("close", {"session": "other"}), ("resume", {"session": "other"}),
             ("resume", {"url": "https://example.test/other"}),
-            ("open", {"headed": "false"}),
-            ("open", {"session": "../outside"}),
+            ("open", {"headed": "false"}), ("open", {"session": "../outside"}),
+            ("wait", {"timeout_seconds": -1}),
         )
         for action, kwargs in invalid_calls:
             with self.subTest(action=action, kwargs=kwargs):
@@ -371,42 +570,50 @@ class BrowserSessionTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "(?i)(use|lock|open)"):
             await second._ensure()
         await first.close()
-        second_session = await second._ensure()
-        self.assertEqual(second_session.context.state, login_state())
+        self.assertEqual((await second._ensure()).context.state, login_state())
+
+    async def test_failed_start_can_retry(self):
+        browser = self.browser(profile_dir=self.profile)
+        FakeSession.fail_next_start = True
+        with self.assertRaisesRegex(RuntimeError, "launch failure"):
+            await browser._ensure()
+        session = await browser._ensure()
+        self.assertEqual(len(FakeSession.instances), 2)
+        await browser.act("observe")
+        self.assertEqual(session.observe_count, 1)
 
     async def test_invalid_named_sessions_cannot_escape_storage_directory(self):
         for name in ("../outside", "/tmp/outside", "nested/session", "..", ".", "bad\\name"):
             with self.subTest(name=name):
                 with self.assertRaises(ValueError):
-                    browser = self.browser(session_name=name)
-                    await browser._ensure()
+                    await self.browser(session_name=name)._ensure()
 
     async def test_autonomous_agent_and_browser_actions_share_session(self):
-        browser = self.browser(state_file=self.path)
+        browser = self.browser(profile_dir=self.profile)
         await browser.act("goto", url="https://example.test")
         session = FakeSession.instances[0]
-        await browser.agent("Check the account", url=None, max_steps=3)
+        await browser.agent("Check the account", max_steps=3)
         await browser.act("observe")
         self.assertEqual(FakeAgent.sessions, [session])
         self.assertEqual(len(FakeSession.instances), 1)
         self.assertEqual(session.context.state["cookies"], [cookie("agent-login")])
 
-    async def test_control_waits_for_browser_action_before_manual_handoff(self):
-        browser = self.browser(state_file=self.path)
+    async def test_handoff_waits_for_active_browser_action(self):
+        browser = self.browser(profile_dir=self.profile)
         session = await browser._ensure()
         started = asyncio.Event()
         release = asyncio.Event()
-        original_execute = session.aexecute
+        original = session.aexecute
 
         async def delayed_execute(**kwargs):
             started.set()
             await release.wait()
-            return await original_execute(**kwargs)
+            return await original(**kwargs)
 
         session.aexecute = delayed_execute
         active = asyncio.create_task(browser.act("goto", url="https://example.test/form"))
         await started.wait()
-        handoff = asyncio.create_task(browser.control("open"))
+        handoff = asyncio.create_task(browser.control("login"))
         try:
             await asyncio.sleep(0)
             self.assertFalse(handoff.done())
@@ -414,66 +621,58 @@ class BrowserSessionTests(unittest.IsolatedAsyncioTestCase):
         finally:
             release.set()
             await asyncio.wait_for(asyncio.gather(active, handoff), timeout=1)
-        shown = FakeSession.instances[-1]
-        self.assertEqual(shown.window.page.url, "https://example.test/form")
+        self.assertEqual(FakeSession.instances[-1].window.page.url, "https://example.test/form")
 
-    async def test_old_thread_cookies_migrate_after_successful_state_save(self):
+    async def test_storage_snapshot_migrates_once_after_native_close(self):
+        legacy = self.root / "storage.json"
+        legacy.write_text(json.dumps(login_state()))
+        browser = self.browser()
+        browser.set_profile(self.profile, legacy_state_file=legacy)
+        session = await browser._ensure()
+        self.assertEqual(session.context.state, login_state())
+        self.assertTrue(legacy.exists())
+        await browser.act("observe")
+        self.assertEqual(len(session.context.restores), 1)
+        self.assertTrue(legacy.exists())
+        await browser.close()
+        self.assertFalse(legacy.exists())
+        self.assertEqual((await self.browser(profile_dir=self.profile)._ensure()).context.state, login_state())
+
+    async def test_old_thread_cookies_migrate_after_native_close(self):
         legacy = self.root / "browser_cookies.json"
         legacy.write_text(json.dumps([cookie("old-thread")]))
         browser = self.browser()
-        browser.set_state_file(self.path, legacy_cookie_file=legacy)
+        browser.set_profile(self.profile, legacy_cookie_file=legacy)
         session = await browser._ensure()
         self.assertEqual(session.context.state["cookies"], [cookie("old-thread")])
         self.assertTrue(legacy.exists())
-        await browser.act("observe")
-        self.assertFalse(legacy.exists())
-        self.assertEqual(json.loads(self.path.read_text())["cookies"], [cookie("old-thread")])
-        session.context.state = {"cookies": [], "origins": []}
         await browser.close()
-        reopened = self.browser()
-        reopened.set_state_file(self.path, legacy_cookie_file=legacy)
-        restored = await reopened._ensure()
-        self.assertEqual(restored.context.state["cookies"], [])
+        self.assertFalse(legacy.exists())
+        restored = await self.browser(profile_dir=self.profile)._ensure()
+        self.assertEqual(restored.context.state["cookies"], [cookie("old-thread")])
 
-    async def test_snapshot_failure_closes_browser_and_releases_session_lock(self):
-        browser = self.browser(state_file=self.path)
-        session = await browser._ensure()
-        session.context.state = login_state()
-        await browser.act("observe")
-
-        async def failed_snapshot(**kwargs):
-            raise RuntimeError("test snapshot failure")
-
-        session.context.storage_state = failed_snapshot
-        with self.assertRaisesRegex(RuntimeError, "snapshot failure"):
-            await browser.close()
-        self.assertEqual(session.exit_count, 1)
-        reopened = await self.browser(state_file=self.path)._ensure()
-        self.assertEqual(reopened.context.state, login_state())
-
-    async def test_failed_snapshot_preserves_legacy_cookie_file(self):
-        legacy = self.root / "browser_cookies.json"
-        legacy.write_text(json.dumps([cookie("old-thread")]))
+    async def test_failed_native_close_preserves_migration_source_and_releases_lock(self):
+        legacy = self.root / "storage.json"
+        legacy.write_text(json.dumps(login_state()))
         browser = self.browser()
-        browser.set_state_file(self.path, legacy_cookie_file=legacy)
+        browser.set_profile(self.profile, legacy_state_file=legacy)
         session = await browser._ensure()
-
-        async def failed_snapshot(**kwargs):
-            raise RuntimeError("test snapshot failure")
-
-        session.context.storage_state = failed_snapshot
-        with self.assertRaisesRegex(RuntimeError, "snapshot failure"):
+        FakeSession.fail_next_close = True
+        with self.assertRaisesRegex(RuntimeError, "native close failure"):
             await browser.close()
-        self.assertEqual(json.loads(legacy.read_text()), [cookie("old-thread")])
-        self.assertFalse(self.path.exists())
+        self.assertTrue(legacy.exists())
+        await session.context.close()
+        restored = await self.browser(profile_dir=self.profile)._ensure()
+        self.assertEqual(restored.context.state, login_state())
 
-    def test_mcp_exposes_session_controls(self):
+    def test_mcp_exposes_login_monitor_controls(self):
         tools = self.code["_browser_mcp_tools"](types.SimpleNamespace(Tool=types.SimpleNamespace))
         controls = next(tool for tool in tools if tool.name == "dtt_browser_session")
         properties = controls.inputSchema["properties"]
-        self.assertEqual(set(properties["action"]["enum"]), {"status", "open", "resume", "close"})
+        self.assertEqual(set(properties["action"]["enum"]), {"status", "open", "resume", "close", "login", "wait"})
         self.assertEqual(properties["session"]["type"], "string")
         self.assertEqual(properties["headed"]["type"], "boolean")
+        self.assertIn("timeout_seconds", properties)
         self.assertIn("action", controls.inputSchema["required"])
 
 

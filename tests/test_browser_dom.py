@@ -27,7 +27,9 @@ class BrowserDomTests(unittest.IsolatedAsyncioTestCase):
         <body><div id="editor" contenteditable="true"></div>
         <input id="upload" type="file" multiple>
         <button id="increment" onclick="window.clicks++">Increment</button>
-        <script>window.events=[];window.clicks=0;
+        <main><button id="trusted" onclick="if(event.isTrusted){window.trustedClicks++}"><span>Publish</span></button></main>
+        <div role="dialog"><button id="dialog-trusted" onclick="if(event.isTrusted){window.dialogTrustedClicks++}"><span>Publish</span></button></div>
+        <script>window.events=[];window.clicks=0;window.trustedClicks=0;window.dialogTrustedClicks=0;
         document.querySelector('#upload').addEventListener('change', event => {
           window.events.push([...event.target.files].map(file => ({name:file.name,size:file.size})));
         });</script></body></html>''')
@@ -99,6 +101,33 @@ class BrowserDomTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["success"], result)
         self.assertEqual(await self.browser.act("evaluate", tab_id=first["tab_id"], code="window.clicks"), {"value": 1})
         self.assertEqual(await self.browser.act("evaluate", tab_id=second["tab_id"], code="window.clicks"), {"value": 0})
+
+    async def test_selector_click_requires_a_trusted_event_and_one_target(self):
+        original = (await self.browser.act("tabs"))["tabs"][0]["tab_id"]
+        await self.browser.act("goto", tab_id=original, url=self.fixture.as_uri())
+        target = await self.browser.act("tab_new", url=self.fixture.as_uri())
+        tab_id = target["tab_id"]
+        await self.browser.act("wait_for", tab_id=tab_id, selector="#trusted", timeout_ms=3000)
+        await self.browser.act("tab_select", tab_id=original)
+        synthetic = await self.browser.act("evaluate", tab_id=tab_id,
+            code="document.querySelector('#trusted').click();window.trustedClicks")
+        self.assertEqual(synthetic, {"value": 0})
+        clicked = await self.browser.act("click_selector", tab_id=tab_id,
+            selector='main button:has(:text-is("Publish"))', timeout_ms=3000)
+        self.assertTrue(clicked["clicked"])
+        self.assertEqual(await self.browser.act("evaluate", tab_id=tab_id, code="window.trustedClicks"), {"value": 1})
+        with self.assertRaisesRegex(Exception, "strict mode violation"):
+            await self.browser.act("click_selector", tab_id=tab_id,
+                selector='button:has(:text-is("Publish"))', timeout_ms=3000)
+        self.assertEqual(await self.browser.act("evaluate", tab_id=tab_id, code="window.trustedClicks"), {"value": 1})
+        self.assertEqual(await self.browser.act("evaluate", tab_id=tab_id, code="window.dialogTrustedClicks"), {"value": 0})
+        await self.browser.act("click_selector", tab_id=tab_id,
+            selector='[role=dialog] button:has(:text-is("Publish"))', timeout_ms=3000)
+        self.assertEqual(await self.browser.act("evaluate", tab_id=tab_id, code="window.dialogTrustedClicks"), {"value": 1})
+        self.assertEqual(await self.browser.act("evaluate", tab_id=original,
+            code="[window.trustedClicks, window.dialogTrustedClicks]"), {"value": [0, 0]})
+        tabs = (await self.browser.act("tabs"))["tabs"]
+        self.assertEqual(next(tab["tab_id"] for tab in tabs if tab["active"]), original)
 
     async def test_native_upload_and_contenteditable_preserve_unicode(self):
         initial = (await self.browser.act("tabs"))["tabs"][0]["tab_id"]

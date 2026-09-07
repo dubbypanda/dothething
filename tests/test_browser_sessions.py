@@ -150,6 +150,7 @@ class FakePage(FakeEvents):
         self.evaluation_value = None
         self.waits = []
         self.uploads = []
+        self.native_clicks = []
         self.main_frame = object()
         context.pages.append(self)
 
@@ -177,7 +178,9 @@ class FakePage(FakeEvents):
     def locator(self, selector):
         async def set_input_files(paths, **kwargs):
             self.uploads.append((selector, paths, kwargs))
-        return types.SimpleNamespace(set_input_files=set_input_files)
+        async def click(**kwargs):
+            self.native_clicks.append((selector, kwargs))
+        return types.SimpleNamespace(set_input_files=set_input_files, click=click)
 
     async def close(self):
         if self.closed:
@@ -806,6 +809,11 @@ class BrowserSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["uploaded"], [str(file)])
         self.assertIs(session.window.page, active)
         self.assertEqual(active.uploads, [])
+        clicked = await browser.act("click_selector", tab_id=first, selector="#editor button", timeout_ms=1234)
+        self.assertEqual(clicked, {"tab_id": first, "url": upload_page.url, "clicked": True})
+        self.assertEqual(upload_page.native_clicks, [("#editor button", {"timeout": 1234})])
+        self.assertEqual(active.native_clicks, [])
+        self.assertIs(session.window.page, active)
 
     async def test_new_operations_obey_manual_and_login_pause_guards(self):
         browser = self.browser(profile_dir=self.profile)
@@ -813,7 +821,7 @@ class BrowserSessionTests(unittest.IsolatedAsyncioTestCase):
         actions = [
             ("tabs", {}), ("tab_new", {}), ("tab_select", {"tab_id": "tab-1"}),
             ("tab_close", {"tab_id": "tab-1"}), ("evaluate", {"code": "42"}),
-            ("wait_for", {"selector": "body"}),
+            ("wait_for", {"selector": "body"}), ("click_selector", {"selector": "button"}),
             ("upload_files", {"selector": "input", "paths": [str(self.root / "none")]}),
         ]
         for login_state_value in (None, "waiting_for_close"):
@@ -829,6 +837,8 @@ class BrowserSessionTests(unittest.IsolatedAsyncioTestCase):
         invalid = [
             ("evaluate", {}), ("evaluate", {"code": 42}), ("evaluate", {"code": ""}),
             ("tab_select", {}), ("tab_close", {"tab_id": 1}),
+            ("click_selector", {}), ("click_selector", {"selector": ""}),
+            ("click_selector", {"selector": "button", "timeout_ms": False}),
             ("tab_new", {"tab_id": "tab-1"}), ("tabs", {"unknown": True}),
             ("wait_for", {"selector": "body", "timeout_ms": True}),
             ("wait_for", {"selector": "body", "timeout_ms": 0}),
@@ -886,7 +896,7 @@ class BrowserSessionTests(unittest.IsolatedAsyncioTestCase):
         tools = self.code["_browser_mcp_tools"](types.SimpleNamespace(Tool=types.SimpleNamespace))
         tool = next(tool for tool in tools if tool.name == "dtt_browser")
         properties = tool.inputSchema["properties"]
-        for action in ("evaluate", "tabs", "tab_new", "tab_select", "tab_close", "wait_for", "upload_files"):
+        for action in ("evaluate", "tabs", "tab_new", "tab_select", "tab_close", "wait_for", "upload_files", "click_selector"):
             self.assertIn(action, properties["action"]["enum"])
         self.assertEqual(properties["paths"]["items"]["type"], "string")
         self.assertEqual(properties["timeout_ms"]["maximum"], 120000)

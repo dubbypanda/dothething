@@ -2698,6 +2698,7 @@ class Browser:
             "screenshot": ("dir", "full_page"), "evaluate": ("code",),
             "tabs": (), "tab_new": ("url",), "tab_select": (), "tab_close": (),
             "wait_for": ("selector", "timeout_ms"),
+            "click_selector": ("selector", "timeout_ms"),
             "upload_files": ("selector", "paths", "timeout_ms"),
         }
         permitted = set(allowed[action])
@@ -2710,7 +2711,8 @@ class Browser:
             "goto": ("url",), "click": ("id",), "fill": ("id", "value"),
             "press_key": ("key",), "evaluate": ("code",),
             "tab_select": ("tab_id",), "tab_close": ("tab_id",),
-            "wait_for": ("selector",), "upload_files": ("selector", "paths"),
+            "wait_for": ("selector",), "click_selector": ("selector",),
+            "upload_files": ("selector", "paths"),
         }
         for key in required.get(action, ()):
             if key not in params:
@@ -2787,6 +2789,9 @@ class Browser:
             if action == "wait_for":
                 await page.wait_for_selector(params["selector"], timeout=params.get("timeout_ms", 30000))
                 return {"tab_id": self._tab_id(page), "url": page.url, "found": True}
+            if action == "click_selector":
+                await page.locator(params["selector"]).click(timeout=params.get("timeout_ms", 30000))
+                return {"tab_id": self._tab_id(page), "url": page.url, "clicked": True}
             if action == "upload_files":
                 await page.locator(params["selector"]).set_input_files(
                     params["paths"], timeout=params.get("timeout_ms", 30000))
@@ -10710,7 +10715,7 @@ ORCHESTRATOR_TOOLS = [
 BROWSER_MCP_ACTIONS = (
     "goto", "observe", "click", "fill", "press_key",
     "scroll_down", "scroll_up", "go_back", "reload", "scrape", "screenshot",
-    "evaluate", "tabs", "tab_new", "tab_select", "tab_close", "wait_for", "upload_files",
+    "evaluate", "tabs", "tab_new", "tab_select", "tab_close", "wait_for", "upload_files", "click_selector",
 )
 
 
@@ -10773,7 +10778,10 @@ def _browser_mcp_tools(types):
                 "tab_select/tab_close {tab_id} select or close it. An optional tab_id on "
                 "other actions targets that tab without changing the default. All tabs "
                 "share this saved context. wait_for {selector, timeout_ms?} waits for a "
-                "visible element; upload_files {selector, paths} sets an input's files "
+                "visible element; click_selector {selector, timeout_ms?} performs a native "
+                "pointer click on one matching element. Scope selectors to the intended "
+                "composer or dialog; multiple matches are an error. "
+                "upload_files {selector, paths} sets an input's files "
                 "from absolute local paths. The session persists "
                 "across calls, and saved logins carry over after restart. Uses "
                 "the same session as dtt_fetch and dtt_browser_agent. When login "
@@ -10789,7 +10797,7 @@ def _browser_mcp_tools(types):
                     "url": {"type": "string", "minLength": 1, "description": "for goto or tab_new"},
                     "tab_id": {"type": "string", "minLength": 1, "description": "stable ID from tabs or tab_new; required for tab_select/tab_close"},
                     "code": {"type": "string", "minLength": 1, "description": "JavaScript script for evaluate; last expression is returned as value"},
-                    "selector": {"type": "string", "minLength": 1, "description": "CSS selector for wait_for or upload_files"},
+                    "selector": {"type": "string", "minLength": 1, "description": "CSS selector for wait_for, click_selector or upload_files"},
                     "paths": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}, "description": "absolute local file paths for upload_files"},
                     "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 120000, "default": 30000},
                     "only_main_content": {"type": "boolean", "description": "for scrape, default true"},

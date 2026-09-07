@@ -103,16 +103,24 @@ Everything else is installed automatically into `/tmp/dothething` on first run.
 
 ## Browser sessions and manual login
 
-Use a named session to keep browser logins between runs:
+DTT and MCP client agents can open a browser when a login or MFA step needs your input. The tools handle this without `--headed` or other startup flags:
+
+1. DTT calls `browser_session(action="open", url="https://github.com/login", result_mode="raw")`. An MCP client calls `dtt_browser_session({"action":"open","url":"https://github.com/login"})`. Either tool opens a visible window and pauses browser automation.
+2. DTT asks you to complete the login through `request_user_input`; an MCP client uses its own user-input path. Leave the window open, then confirm when you are done. The agent waits for your reply.
+3. After your confirmation, DTT calls `browser_session(action="resume", result_mode="raw")`. An MCP client calls `dtt_browser_session({"action":"resume"})`. This saves the browser state and lets the agent continue its task with the same session.
+
+The agent must identify that a manual login is needed and use this sequence. The session tool does not detect login requirements or verify that the login succeeded.
+
+To reuse logins across separate tasks, add `session="work"` to DTT's open call or `"session":"work"` to the MCP call. You can also select a named session on the command line:
 
 ```bash
-dtt --browser-session work --headed "Open https://github.com/login for me to log in. Wait for my confirmation, then list my repositories."
+dtt --browser-session work "List my repositories. Open the browser for me if I need to log in."
 dtt --browser-session work "List my repositories."
 ```
 
 Without a name, each thread keeps its own browser state, which `--resume` restores. Set `DTT_BROWSER_SESSION=work` in your shell or `~/.dtt/env` to choose a default name. An explicit flag takes precedence; a resumed thread keeps its saved selection ahead of the environment default.
 
-The `browser_session` tool opens a window and pauses browser automation while you handle a login or MFA. Leave the window open, then tell the agent when you are done. It calls `browser_session` with `action="resume"` to save the login and continue. `--headed` makes browser windows visible, but does not itself pause automation. Use `--headless` to hide the window on a later run, including a resumed thread that was previously headed.
+`--headed` makes browser windows visible from the first browser action, but does not itself pause automation. Use `--headless` to hide the window on a later run, including a resumed thread that was previously headed. The session tool can still open a window for a login when the run starts headless.
 
 Page fetches and the autonomous browser agent use the same browser session. The MCP browser tools share it too. Fetch mode `text` starts with a separate HTTP request without saved browser logins and can retry through the browser if the request is blocked. Use mode `markdown` for pages that require your login. The search bridge has its own headless browsers.
 
@@ -129,7 +137,7 @@ Add dtt to your MCP client's configuration. Use an absolute path to the installe
   "mcpServers": {
     "dtt-browser": {
       "command": "/Users/you/.local/bin/dtt",
-      "args": ["--browsermcp", "--browser-session", "work", "--headed"]
+      "args": ["--browsermcp", "--browser-session", "work"]
     }
   }
 }

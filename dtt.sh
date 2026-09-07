@@ -164,7 +164,7 @@ for arg in "$@"; do
       BROWSER_MCP=true
       PASS_ARGS+=("$arg")
       ;;
-    --headed|--orchestrator|--pipe|--notify-desktop|--tui)
+    --headed|--headless|--orchestrator|--pipe|--notify-desktop|--tui)
       PASS_ARGS+=("$arg")
       ;;
     --notify-email|--max-cost)
@@ -186,7 +186,8 @@ dothething — autonomous AI agent | https://dotheth.ing
 
 Usage:
   ./dtt.sh [q] [--advanced] [--prompt "..."] [--cwd DIR] [--max-loops N]
-           [--model [ROLE=]SLUG] [--headed] [--orchestrator]
+           [--model [ROLE=]SLUG] [--headed|--headless] [--browser-session NAME]
+           [--browsermcp] [--orchestrator]
            [--verbose] [--debug] [--keep-temp] [--resume THREAD_ID]
            [--version] [--update] [--install] [--pipe] [--tui]
            [--notify-desktop] [--notify-email EMAIL] [--max-cost USD]
@@ -229,8 +230,17 @@ Flags:
                   Combine with --prompt or positional text, or just let the
                   editor open, to supply fresh instructions on resume.
                   Inherits the thread's saved config (model, oracle, --max-loops,
-                  --cwd); pass a flag explicitly to override it.
-  --headed        Show the browser window for visual debugging
+                  --cwd, browser session and display mode); pass a flag to override it.
+  --browser-session NAME
+                  Reuse saved browser logins across runs. Defaults to a separate
+                  session per thread, or "default" in --browsermcp mode.
+                  Env: DTT_BROWSER_SESSION. Only one process can use a named
+                  session at a time.
+  --headed        Show the browser window, including in --browsermcp mode
+  --headless      Hide the browser window; overrides a resumed thread's setting
+  --browsermcp    Expose search and browser tools through a stdio MCP server.
+                  Use dtt_browser_session to open a window for manual login,
+                  then resume automation with the saved login.
   --orchestrator  Launch orchestrator mode (manage multiple parallel agents)
   --pipe          Pipe mode: only final report on stdout, all other output suppressed
   --tui           Full-screen terminal UI for single-agent mode (experimental)
@@ -253,6 +263,7 @@ Environment:
   DTT_MODEL_WORKER       Optional. Same for the worker (summaries, delegation, batch).
   DTT_MODEL_ORACLE       Optional. Same for the oracle.
   DTT_MODEL_BROWSER      Optional. Same for the Notte browser agent.
+  DTT_BROWSER_SESSION    Optional. Named browser session to reuse across runs.
   DTT_NOTTE_SERP_SESSIONS  Optional. Browser sessions backing the search bridge
                          (default 4, max 8). General-web engines fetch their
                          SERPs through these; more sessions means faster
@@ -468,6 +479,10 @@ NOTTE_REPO="https://github.com/fluffypony/notte.git"
 # Dependency order, so each is present before whatever imports it.
 NOTTE_PACKAGES="notte-core notte-llm notte-browser notte-sdk notte-agent"
 
+browser_storage_ready() {
+    python -c 'from playwright.async_api import BrowserContext; assert hasattr(BrowserContext, "set_storage_state")' >/dev/null 2>&1
+}
+
 install_notte() (
     # MCP clients can retry a slow first start while the original process is
     # still installing. Serialise the shared checkout and venv update so one
@@ -515,6 +530,9 @@ install_notte() (
     # The process that held the lock can have finished while this process
     # waited. In that case the installed packages are already current.
     if [ "$(cat "$DTT_CACHE/.notte_pin" 2>/dev/null)" = "$NOTTE_PIN" ]; then
+        if ! browser_storage_ready; then
+            pip install -q --disable-pip-version-check 'playwright>=1.59,<2'
+        fi
         exit 0
     fi
 
@@ -579,7 +597,7 @@ PY
     # every requirement and everything they pull in, which cost more time than
     # the six clones this replaced.
     echo "  ▸ installing $(wc -l < "$notte_reqs" | tr -d ' ') dependencies..."
-    pip install -q --disable-pip-version-check -r "$notte_reqs" >>"$notte_log" 2>&1 \
+    pip install -q --disable-pip-version-check 'playwright>=1.59,<2' -r "$notte_reqs" >>"$notte_log" 2>&1 \
         || notte_fail "Notte dependency install failed"
 
     notte_paths=""
@@ -604,7 +622,7 @@ PY
 )
 
 export DTT_NOTTE_PIN="$NOTTE_PIN"
-if [ "$(cat "$DTT_CACHE/.notte_pin" 2>/dev/null)" != "$NOTTE_PIN" ]; then
+if [ "$(cat "$DTT_CACHE/.notte_pin" 2>/dev/null)" != "$NOTTE_PIN" ] || ! browser_storage_ready; then
     if [ "$BROWSER_MCP" = true ]; then
         # Complete a slow Notte update after the MCP server has answered its
         # handshake. Browser tools report that they are starting until this
@@ -682,7 +700,7 @@ cat > "$BASE/agent.py" << 'PYTHON_AGENT'
 import os, sys, json, time, asyncio, subprocess, socket, re, atexit, signal
 import threading, argparse, shlex, shutil, traceback, copy, stat
 import fnmatch, difflib, hashlib, base64, mimetypes, uuid
-import tempfile, contextlib, concurrent.futures
+import tempfile, contextlib
 from pathlib import Path
 from datetime import datetime, timezone
 from urllib.parse import urlsplit, urlunsplit
@@ -1915,85 +1933,6 @@ class SearXNG:
         return f"http://127.0.0.1:{self.port}" if self.port else None
 
 # ═══════════════════════════════════════════════════════════════════
-# Fetch Cache — short-TTL disk cache for web content
-# ═══════════════════════════════════════════════════════════════════
-class FetchCache:
-    def __init__(self, cache_dir=None, default_ttl=300):
-        self.cache_dir = Path(cache_dir or BASE / "fetch_cache")
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self.default_ttl = default_ttl
-
-    def _key(self, *parts):
-        raw = "|".join(str(p) for p in parts)
-        return hashlib.sha256(raw.encode()).hexdigest()[:32]
-
-    def get(self, *key_parts, ttl=None):
-        k = self._key(*key_parts)
-        path = self.cache_dir / f"{k}.json"
-        if not path.exists():
-            return None
-        try:
-            data = json.loads(path.read_text())
-            if time.time() - data["ts"] > (ttl or self.default_ttl):
-                path.unlink(missing_ok=True)
-                return None
-            return data["content"]
-        except Exception:
-            return None
-
-    def put(self, content, *key_parts):
-        k = self._key(*key_parts)
-        path = self.cache_dir / f"{k}.json"
-        path.write_text(json.dumps({"ts": time.time(), "content": content}))
-
-def _cookie_key(cookie):
-    return (
-        str(cookie.get("domain") or cookie.get("url") or ""),
-        str(cookie.get("path") or "/"),
-        str(cookie.get("name") or ""),
-    )
-
-def _merge_browser_cookies(cookie_file, cookies):
-    """Persist cookies without unbounded duplicate growth across tool calls."""
-    if not cookie_file or not cookies:
-        return
-    path = Path(cookie_file)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    existing = []
-    if path.exists():
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(data, list):
-                existing = [c for c in data if isinstance(c, dict)]
-        except Exception:
-            existing = []
-
-    merged = {}
-    order = []
-    for cookie in existing + [c for c in cookies if isinstance(c, dict)]:
-        key = _cookie_key(cookie)
-        if not key[2]:
-            continue
-        if key not in merged:
-            order.append(key)
-        merged[key] = cookie
-
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(
-        json.dumps([merged[k] for k in order], ensure_ascii=False),
-        encoding="utf-8",
-    )
-    try:
-        os.chmod(tmp, 0o600)
-    except Exception:
-        pass
-    tmp.replace(path)
-    try:
-        os.chmod(path, 0o600)
-    except Exception:
-        pass
-
-# ═══════════════════════════════════════════════════════════════════
 # Browser — Notte + Camoufox
 # ═══════════════════════════════════════════════════════════════════
 class Browser:
@@ -2009,48 +1948,192 @@ class Browser:
         "initializing", "spinner", "skeleton",
     ]
 
-    def __init__(self, headless=True, cookie_file=None):
+    def __init__(self, headless=True, session_name=None, state_file=None):
         self._session = None
         self._lock = asyncio.Lock()
-        self._fetch_lock = asyncio.Lock()
+        self._operation_lock = asyncio.Lock()
         self._headless = headless
-        self._cookie_file = Path(cookie_file) if cookie_file else None
+        self._paused = False
+        self._state_lock = None
+        self._legacy_cookie_file = None
+        self.session_name = None
+        self._state_file = Path(state_file) if state_file else None
+        if session_name is not None:
+            self._select_session(session_name)
 
-    def set_cookie_file(self, cookie_file):
-        self._cookie_file = Path(cookie_file) if cookie_file else None
+    @staticmethod
+    def validate_session_name(name):
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", name):
+            raise ValueError("Browser session names must contain 1-64 letters, digits, underscores or hyphens, starting with a letter or digit.")
+        return name
 
-    async def _load_cookies(self, session):
-        if not self._cookie_file or not self._cookie_file.exists():
+    def _select_session(self, name):
+        self.session_name = self.validate_session_name(name)
+        self._state_file = Path.home() / ".dtt" / "browser-sessions" / name / "storage.json"
+        self._legacy_cookie_file = None
+
+    def set_state_file(self, path, legacy_cookie_file=None):
+        if self._session is not None:
+            raise RuntimeError("Close the browser before changing its state file.")
+        self._state_file = Path(path)
+        self._legacy_cookie_file = Path(legacy_cookie_file) if legacy_cookie_file else None
+
+    def _acquire_state_lock(self):
+        if self._state_file is None or self._state_lock is not None:
             return
+        import fcntl
+        directory = self._state_file.parent
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        directory.chmod(0o700)
+        fd = os.open(directory / ".lock", os.O_CREAT | os.O_RDWR, 0o600)
         try:
-            await session.aset_cookies(cookie_file=self._cookie_file)
-        except Exception:
-            pass
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            raise RuntimeError(
+                f"Browser session '{self.session_name or directory.name}' is in use by another process. "
+                "Close that browser session or select a different --browser-session name."
+            ) from None
+        self._state_lock = fd
 
-    async def _save_cookies(self, session):
-        if not self._cookie_file:
+    def _release_state_lock(self):
+        if self._state_lock is not None:
+            os.close(self._state_lock)
+            self._state_lock = None
+
+    async def _save_state(self, session):
+        if self._state_file is None:
             return
+        state = await session.window.page.context.storage_state(indexed_db=True)
+        fd, temp_path = tempfile.mkstemp(prefix=".storage-", dir=self._state_file.parent)
         try:
-            _merge_browser_cookies(self._cookie_file, await session.aget_cookies())
-        except Exception:
-            pass
+            with os.fdopen(fd, "w", encoding="utf-8") as out:
+                json.dump(state, out, ensure_ascii=False)
+                out.flush()
+                os.fsync(out.fileno())
+            os.replace(temp_path, self._state_file)
+        finally:
+            Path(temp_path).unlink(missing_ok=True)
+        # Old thread caches contain cookies only. Remove each old file after
+        # its first successful snapshot; this path retires as those caches migrate.
+        if self._legacy_cookie_file:
+            self._legacy_cookie_file.unlink(missing_ok=True)
+            self._legacy_cookie_file = None
 
     async def _ensure(self):
         async with self._lock:
+            if self._session is not None and self._session.window.page.is_closed():
+                await self._close_session(save=False)
             if self._session is None:
                 import notte
                 _configure_redacted_loguru_logging()
-                self._session = notte.Session(
-                    headless=self._headless,
-                    browser_type="camoufox",
-                    solve_captchas=bool(os.environ.get("TWOCAPTCHA_API_KEY")),
-                    perception_type="fast",
-                    viewport_width=DEFAULT_HEADLESS_VIEWPORT_WIDTH,
-                    viewport_height=DEFAULT_HEADLESS_VIEWPORT_HEIGHT,
-                )
-                await self._session.__aenter__()
-                await self._load_cookies(self._session)
-        return self._session
+                self._acquire_state_lock()
+                session = None
+                try:
+                    session = notte.Session(
+                        headless=self._headless,
+                        browser_type="camoufox",
+                        solve_captchas=bool(os.environ.get("TWOCAPTCHA_API_KEY")),
+                        perception_type="fast",
+                        viewport_width=DEFAULT_HEADLESS_VIEWPORT_WIDTH,
+                        viewport_height=DEFAULT_HEADLESS_VIEWPORT_HEIGHT,
+                    )
+                    await session.__aenter__()
+                    if self._state_file and self._state_file.exists():
+                        await session.window.page.context.set_storage_state(self._state_file)
+                    elif self._legacy_cookie_file and self._legacy_cookie_file.exists():
+                        await session.aset_cookies(cookie_file=self._legacy_cookie_file)
+                    self._session = session
+                except BaseException:
+                    if session is not None:
+                        with contextlib.suppress(Exception):
+                            await session.__aexit__(None, None, None)
+                    self._release_state_lock()
+                    raise
+            return self._session
+
+    def _check_automation(self):
+        if self._paused:
+            raise RuntimeError("Browser automation is paused for a manual login. Wait for the user, then call the browser session control tool with action='resume'.")
+
+    def _status(self):
+        return {
+            "session": self.session_name,
+            "state_file": str(self._state_file) if self._state_file else None,
+            "open": self._session is not None and not self._session.window.page.is_closed(),
+            "headed": not self._headless,
+            "paused": self._paused,
+            "url": self._session.window.page.url if self._session else None,
+        }
+
+    async def _close_session(self, save=True):
+        session = self._session
+        try:
+            if session is not None:
+                try:
+                    if save:
+                        await self._save_state(session)
+                finally:
+                    await session.__aexit__(None, None, None)
+        finally:
+            self._session = None
+            self._release_state_lock()
+
+    async def control(self, action, session=None, headed=None, url=None):
+        if action not in ("status", "open", "resume", "close"):
+            raise ValueError("Unknown browser session action. Use status, open, resume or close.")
+        if action != "open" and (session is not None or url is not None):
+            raise ValueError("session and url are only valid with action='open'.")
+        if headed is not None:
+            if not isinstance(headed, bool):
+                raise ValueError("headed must be a boolean.")
+            if action not in ("open", "resume"):
+                raise ValueError("headed is only valid with action='open' or 'resume'.")
+        async with self._operation_lock:
+            if action == "status":
+                return self._status()
+            if action == "close":
+                await self._close_session()
+                self._paused = False
+                return self._status()
+            if action == "resume":
+                if self._session is None:
+                    raise RuntimeError("No browser is open. Call the browser session control tool with action='open' first.")
+                if self._session.window.page.is_closed():
+                    raise RuntimeError("The login window was closed. Call the browser session control tool with action='open' to reopen it.")
+                if headed is None:
+                    headed = not self._headless
+            if session is not None:
+                self.validate_session_name(session)
+            headless = not (True if headed is None else headed)
+            changing_session = session is not None and session != self.session_name
+            previous_url = None
+            memory_state = None
+            self._paused = True
+            if self._session is not None and (changing_session or headless != self._headless):
+                if not changing_session:
+                    previous_url = self._session.window.page.url
+                    if self._state_file is None:
+                        memory_state = await self._session.window.page.context.storage_state(indexed_db=True)
+                await self._close_session()
+            if changing_session:
+                self._select_session(session)
+            self._headless = headless
+            active = await self._ensure()
+            if memory_state is not None:
+                await active.window.page.context.set_storage_state(memory_state)
+            target = url or previous_url
+            if target and target != "about:blank":
+                result = await active.aexecute(type="goto", url=target)
+                if not result.success:
+                    raise RuntimeError(f"Error navigating to {target}: {result.message}")
+            if not self._headless:
+                await active.window.page.bring_to_front()
+            await self._save_state(active)
+            if action == "resume":
+                self._paused = False
+                return self._status()
+            return {**self._status(), "message": "Complete the login in the browser and leave the window open. Wait for the user's confirmation, then call the browser session control tool with action='resume' to continue."}
 
     @staticmethod
     def _looks_like_captcha(text):
@@ -2203,15 +2286,13 @@ class Browser:
     async def fetch(self, url, mode="markdown", screenshot_region="above",
                     timeout_ms=45000, extract_selector=None, wait_for=None,
                     screenshot_dir=None):
-        async with self._fetch_lock:
+        async with self._operation_lock:
+          self._check_automation()
           try:
             session = await self._ensure()
           except Exception as e:
-            async with self._lock:
-                self._session = None
             return f"Error launching browser: {e}"
           try:
-            await self._load_cookies(session)
             result = await session.aexecute(type="goto", url=url)
             if not result.success:
                 return f"Error navigating to {url}: {result.message}"
@@ -2337,11 +2418,9 @@ class Browser:
                 return f"# {title}\n\nURL: {current_url}\n\n{markdown or '(empty page)'}"
 
           except Exception as e:
-            async with self._lock:
-                self._session = None
             return f"Error fetching {url}: {e}"
           finally:
-            await self._save_cookies(session)
+            await self._save_state(session)
 
     async def fetch_serp(self, url, timeout_ms=30000, method="GET",
                          form=None, body_json=None, body_text=None, mode="fetch"):
@@ -2369,15 +2448,13 @@ class Browser:
         except Exception:
             pass
 
-        async with self._fetch_lock:
+        async with self._operation_lock:
+            self._check_automation()
             try:
                 session = await self._ensure()
             except Exception as e:
-                async with self._lock:
-                    self._session = None
                 raise RuntimeError(f"browser launch failed: {e}") from e
             try:
-                await self._load_cookies(session)
                 page = session.window.page
                 if origin and not (page.url or "").startswith(origin):
                     result = await session.aexecute(type="goto", url=origin)
@@ -2448,7 +2525,7 @@ class Browser:
                     "status": int(payload.get("status") or 200),
                 }
             finally:
-                await self._save_cookies(session)
+                await self._save_state(session)
 
     async def act(self, action, **params):
         """Granular step against the persistent session, for the browser MCP.
@@ -2457,59 +2534,81 @@ class Browser:
         can drive a real browser step by step. Returns a dict; callers serialise
         it. `observe` returns the interactable element map (ids to act on).
         """
-        session = await self._ensure()
-        await self._load_cookies(session)
-        try:
-            if action == "observe":
-                obs = await session.aobserve()
-                els = []
-                space = getattr(obs, "space", None)
-                for a in (getattr(space, "interaction_actions", None) or []):
-                    els.append({
-                        "id": getattr(a, "id", None),
-                        "description": getattr(a, "description", "") or "",
-                        "type": type(a).__name__,
-                    })
+        async with self._operation_lock:
+            self._check_automation()
+            session = await self._ensure()
+            try:
+                if action == "observe":
+                    obs = await session.aobserve()
+                    els = []
+                    space = getattr(obs, "space", None)
+                    for a in (getattr(space, "interaction_actions", None) or []):
+                        els.append({
+                            "id": getattr(a, "id", None),
+                            "description": getattr(a, "description", "") or "",
+                            "type": type(a).__name__,
+                        })
+                    page = session.window.page if session.window else None
+                    return {"url": getattr(page, "url", ""),
+                            "title": (await page.title()) if page else "",
+                            "elements": els[:200], "element_count": len(els)}
+
+                if action == "scrape":
+                    md = await session.ascrape(only_main_content=params.get("only_main_content", True))
+                    page = session.window.page if session.window else None
+                    return {"url": getattr(page, "url", ""), "markdown": (md or "")[:50000]}
+
+                if action == "screenshot":
+                    out_dir = params.get("dir") or str(BASE / "screenshots")
+                    Path(out_dir).mkdir(parents=True, exist_ok=True)
+                    path = str(Path(out_dir) / f"browser_{int(time.time()*1000)}.png")
+                    data = await session.window.page.screenshot(full_page=params.get("full_page", False))
+                    Path(path).write_bytes(data)
+                    return {"screenshot": path}
+
+                # Everything else maps to a Notte execute action. Notte validates
+                # the type and params and returns a result with .success/.message.
+                exec_kwargs = {"type": action}
+                exec_kwargs.update({k: v for k, v in params.items() if v is not None})
+                result = await session.aexecute(**exec_kwargs)
                 page = session.window.page if session.window else None
-                return {"url": getattr(page, "url", ""),
-                        "title": (await page.title()) if page else "",
-                        "elements": els[:200], "element_count": len(els)}
+                return {
+                    "success": bool(getattr(result, "success", True)),
+                    "message": getattr(result, "message", "") or "",
+                    "url": getattr(page, "url", "") if page else "",
+                }
+            finally:
+                await self._save_state(session)
 
-            if action == "scrape":
-                md = await session.ascrape(only_main_content=params.get("only_main_content", True))
-                page = session.window.page if session.window else None
-                return {"url": getattr(page, "url", ""), "markdown": (md or "")[:50000]}
-
-            if action == "screenshot":
-                out_dir = params.get("dir") or str(BASE / "screenshots")
-                Path(out_dir).mkdir(parents=True, exist_ok=True)
-                path = str(Path(out_dir) / f"browser_{int(time.time()*1000)}.png")
-                data = await session.window.page.screenshot(full_page=params.get("full_page", False))
-                Path(path).write_bytes(data)
-                return {"screenshot": path}
-
-            # Everything else maps to a Notte execute action. Notte validates
-            # the type and params and returns a result with .success/.message.
-            exec_kwargs = {"type": action}
-            exec_kwargs.update({k: v for k, v in params.items() if v is not None})
-            result = await session.aexecute(**exec_kwargs)
-            page = session.window.page if session.window else None
-            return {
-                "success": bool(getattr(result, "success", True)),
-                "message": getattr(result, "message", "") or "",
-                "url": getattr(page, "url", "") if page else "",
-            }
-        finally:
-            await self._save_cookies(session)
+    async def agent(self, task, url=None, max_steps=20):
+        async with self._operation_lock:
+            self._check_automation()
+            session = await self._ensure()
+            import notte
+            try:
+                if url:
+                    nav = await session.aexecute(type="goto", url=url)
+                    if not nav.success:
+                        return f"Error navigating to {url}: {nav.message}"
+                agent = notte.Agent(
+                    session=session,
+                    reasoning_model=f"openrouter/{BROWSER_AGENT_MODEL}",
+                    max_steps=max_steps,
+                )
+                response = await agent.arun(task=task)
+                result = str(response.answer) if hasattr(response, "answer") else str(response)
+                with contextlib.suppress(Exception):
+                    markdown = await session.ascrape(only_main_content=True)
+                    if markdown:
+                        result += f"\n\n--- Final page state (URL: {session.window.page.url}) ---\n{markdown[:50000]}"
+                return result
+            finally:
+                await self._save_state(session)
 
     async def close(self):
-        async with self._lock:
-            if self._session:
-                try:
-                    await self._session.__aexit__(None, None, None)
-                except Exception:
-                    pass
-                self._session = None
+        async with self._operation_lock:
+            await self._close_session()
+            self._paused = False
 
 # ═══════════════════════════════════════════════════════════════════
 # Notte SERP bridge — lets SearXNG fetch through a real browser
@@ -4771,6 +4870,32 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser_session",
+            "description": (
+                "Manage the browser shared by fetch_page and browser_agent. "
+                "Use open to show it for a manual login and pause browser automation. "
+                "Ask the user to complete the login and leave the window open; wait for their confirmation "
+                "before resume. Resume saves the login and allows automation again. "
+                "Named sessions persist cookies, localStorage and IndexedDB across runs. "
+                "Changing headed mode restarts the browser and reloads the current URL. "
+                "Status reports the current session; close saves and closes it."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["status", "open", "resume", "close"]},
+                    "session": {"type": "string", "description": "Optional session name for open. Omit to keep the current session."},
+                    "headed": {"type": "boolean", "description": "Show the browser window. Open defaults to true; resume keeps the current mode unless set."},
+                    "url": {"type": "string", "description": "Optional URL to open for login."},
+                    "result_mode": RESULT_MODE_PROP,
+                },
+                "required": ["action", "result_mode"],
+            },
+        },
+    },
     # ── Self-config management ──
     {
         "type": "function",
@@ -5904,6 +6029,7 @@ class Agent:
         "use_skill":       "_tool_use_skill",
         "batch_process":   "_tool_batch_process",
         "browser_agent":   "_tool_browser_agent",
+        "browser_session": "_tool_browser_session",
         # Self-config management
         "manage_config":   "_tool_manage_config",
         "manage_skill":    "_tool_manage_skill",
@@ -5927,7 +6053,7 @@ class Agent:
         "shell_session":       "_tool_shell_session",
     }
 
-    def __init__(self, model, oracle_model, api_key, cwd, debug=False, verbose=False, headed=False, mode="normal"):
+    def __init__(self, model, oracle_model, api_key, cwd, debug=False, verbose=False, headed=False, mode="normal", browser_session=None):
         self.model = model
         self.oracle_model = oracle_model
         self._ctx_tokens = 0  # last model-call prompt_tokens, for the context-depth meter
@@ -5958,16 +6084,8 @@ class Agent:
         self.headers = _make_headers(api_key)
         self.messages = []
         self.searxng = SearXNG()
-        self.serp_bridge = NotteSerpBridge(headless=not headed)
-        self.browser = Browser(headless=not headed)
-        self._browser_cookie_file = None
-        self._browser_agent_session = None
-        self._browser_agent_lock = asyncio.Lock()
-        self._browser_agent_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1,
-            thread_name_prefix="dtt-browser-agent",
-        )
-        self.fetch_cache = FetchCache()
+        self.serp_bridge = NotteSerpBridge()
+        self.browser = Browser(headless=not headed, session_name=browser_session)
         self.cost_tracker = CostTracker(api_key)
         self.plan = Plan()
         self.notes = Notes()
@@ -6639,22 +6757,13 @@ class Agent:
             if escalate:
                 mode = "markdown"   # fall through to the browser below
 
-        # Check disk cache for markdown/html modes (not screenshots)
-        cache_key = (url, mode, extract_selector or "", wait_for or "")
-        if mode in ("markdown", "html"):
-            cached = self.fetch_cache.get(*cache_key)
-            if cached:
-                return f"[CACHED CONTENT — source: {url}]\n\n{cached}"
-
+        # Browser content reflects the live login state; do not reuse URL-only cache entries.
         try:
             screenshot_dir = self.thread_logger.cache_dir if self.thread_logger else None
             result = await self.browser.fetch(url, mode, screenshot_region, timeout_ms,
                                               extract_selector=extract_selector,
                                               wait_for=wait_for,
                                               screenshot_dir=screenshot_dir)
-
-            if mode in ("markdown", "html") and not result.startswith("Error"):
-                self.fetch_cache.put(result, *cache_key)
 
             if mode == "screenshot":
                 return result
@@ -7617,78 +7726,28 @@ class Agent:
             f"Successful: {len(items) - errors[0]}, Errors: {errors[0]}"
         )
 
+    async def _tool_browser_session(self, action, session=None, headed=None, url=None, **kw):
+        try:
+            result = await self.browser.control(action, session=session, headed=headed, url=url)
+            return json.dumps(result, indent=2)
+        finally:
+            self.headed = not self.browser._headless
+            if self.thread_logger:
+                meta = self.thread_logger.load_meta() or {}
+                meta.update(browser_session=self.browser.session_name, headed=self.headed)
+                self.thread_logger.save_meta(meta)
+
     async def _tool_browser_agent(self, task, url=None, max_steps=20, **kw):
         self._browser_agent_used = True
         max_steps = max(1, min(int(max_steps or 20), 50))
-        headed = self.headed
-        cookie_file = self._browser_cookie_file
-
-        def _run():
-            import notte
-            _configure_redacted_loguru_logging()
-            if self._browser_agent_session is None:
-                session = notte.Session(
-                    headless=not headed,
-                    browser_type="camoufox",
-                    solve_captchas=bool(os.environ.get("TWOCAPTCHA_API_KEY")),
-                    perception_type="fast",
-                    viewport_width=DEFAULT_HEADLESS_VIEWPORT_WIDTH,
-                    viewport_height=DEFAULT_HEADLESS_VIEWPORT_HEIGHT,
-                )
-                session.__enter__()
-                self._browser_agent_session = session
-
-            session = self._browser_agent_session
-            if cookie_file and Path(cookie_file).exists():
-                try:
-                    session.set_cookies(cookie_file=cookie_file)
-                except Exception:
-                    pass
-            try:
-                if url:
-                    nav = session.execute(type="goto", url=url)
-                    if not nav.success:
-                        return f"Error navigating to {url}: {nav.message}"
-                agent = notte.Agent(
-                    session=session,
-                    reasoning_model=f"openrouter/{BROWSER_AGENT_MODEL}",
-                    max_steps=max_steps,
-                )
-                response = agent.run(task=task)
-                result_text = str(response.answer) if hasattr(response, "answer") else str(response)
-                try:
-                    final_md = session.scrape(only_main_content=True)
-                    final_url = session.window.page.url if session.window else "(unknown)"
-                    if final_md:
-                        result_text += f"\n\n--- Final page state (URL: {final_url}) ---\n{final_md[:50000]}"
-                except Exception:
-                    pass
-                return result_text
-            finally:
-                if cookie_file:
-                    try:
-                        _merge_browser_cookies(cookie_file, session.get_cookies())
-                    except Exception:
-                        pass
-
         self.spinner.update(f"Browser agent working: {task[:50]}...")
-        reset_session = False
-        error_text = None
-        async with self._browser_agent_lock:
-            try:
-                loop = asyncio.get_running_loop()
-                result = await loop.run_in_executor(self._browser_agent_executor, _run)
-                return f"[Browser agent result — task: {task}]\n\n{result}"
-            except Exception as e:
-                if self.verbose:
-                    traceback.print_exc()
-                err = str(e)
-                if "closed" in err.lower() or "target" in err.lower():
-                    reset_session = True
-                error_text = f"Browser agent error: {e}"
-        if reset_session:
-            await self._close_browser_agent_session()
-        return error_text
+        try:
+            result = await self.browser.agent(task, url=url, max_steps=max_steps)
+            return f"[Browser agent result — task: {task}]\n\n{result}"
+        except Exception as e:
+            if self.verbose:
+                traceback.print_exc()
+            return f"Browser agent error: {e}"
 
     # ── Self-config management tools ─────────────────────────────
     async def _tool_manage_config(self, action, key=None, value=None, **kw):
@@ -8768,9 +8827,11 @@ class Agent:
             if self.thread_logger
             else "(unavailable)"
         )
-        if self.thread_logger:
-            self._browser_cookie_file = self.thread_logger.cache_dir / "browser_cookies.json"
-            self.browser.set_cookie_file(self._browser_cookie_file)
+        if self.thread_logger and self.browser.session_name is None:
+            self.browser.set_state_file(
+                self.thread_logger.cache_dir / "browser_storage.json",
+                legacy_cookie_file=self.thread_logger.cache_dir / "browser_cookies.json",
+            )
         self._base_system_prompt = (QUICK_SYSTEM_PROMPT if self.quick else SYSTEM_PROMPT).format(
             cwd=self.cwd,
             platform=f"{plat.system()} {plat.machine()}",
@@ -8858,6 +8919,8 @@ class Agent:
                 existing_meta["cwd"] = str(self.cwd)
                 existing_meta["max_loops"] = max_loops
                 existing_meta["mode"] = self.mode
+                existing_meta["browser_session"] = self.browser.session_name
+                existing_meta["headed"] = not self.browser._headless
                 existing_meta["model_overrides"] = self._model_overrides
                 existing_meta.setdefault("thread_id", thread_id)
                 existing_meta["resumed_at"] = now.isoformat()
@@ -8875,6 +8938,8 @@ class Agent:
                     "cwd": str(self.cwd),
                     "max_loops": max_loops,
                     "mode": self.mode,
+                    "browser_session": self.browser.session_name,
+                    "headed": not self.browser._headless,
                     "model_overrides": self._model_overrides,
                     "prompt": prompt,
                     "started_at": now.isoformat(),
@@ -9825,30 +9890,6 @@ class Agent:
             print("    (Note: browser_agent LLM calls via Notte are not included in this total.)", file=sys.stderr)
         print(f"{'━' * 58}", file=sys.stderr)
 
-    async def _close_browser_agent_session(self):
-        async with self._browser_agent_lock:
-            if self._browser_agent_session is None:
-                return
-
-            def _close():
-                session = self._browser_agent_session
-                self._browser_agent_session = None
-                try:
-                    if self._browser_cookie_file:
-                        _merge_browser_cookies(
-                            self._browser_cookie_file,
-                            session.get_cookies(),
-                        )
-                except Exception:
-                    pass
-                try:
-                    session.__exit__(None, None, None)
-                except Exception:
-                    pass
-
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(self._browser_agent_executor, _close)
-
     # ── Cleanup ──────────────────────────────────────────────────
     async def cleanup(self):
         mcp_mode = getattr(self, "_mcp_mode", False)
@@ -9872,9 +9913,10 @@ class Agent:
         self.searxng.stop()
         if self.serp_bridge:
             self.serp_bridge.stop()
-        await self._close_browser_agent_session()
-        self._browser_agent_executor.shutdown(wait=False, cancel_futures=True)
-        await self.browser.close()
+        try:
+            await self.browser.close()
+        except Exception as e:
+            print(f"Browser state could not be saved: {e}", file=sys.stderr)
         await self.mcp_manager.stop()
         if not mcp_mode:
             print("  ⏳ Fetching cost data…", file=sys.stderr)
@@ -10073,8 +10115,9 @@ async def run_agent(prompt, model, oracle_model, api_key, cwd, max_loops,
                     control_file=None, searxng_url=None, pipe_mode=False,
                     notify_desktop=False, notify_email=None, max_cost=None,
                     tui_mode=False, show_full=False, mode="normal",
-                    model_overrides=None):
-    agent = Agent(model, oracle_model, api_key, cwd, debug=debug, verbose=verbose, headed=headed, mode=mode)
+                    model_overrides=None, browser_session=None):
+    agent = Agent(model, oracle_model, api_key, cwd, debug=debug, verbose=verbose,
+                  headed=headed, mode=mode, browser_session=browser_session)
     agent._model_overrides = dict(model_overrides or {})
     agent._show_full = show_full
     if show_full:
@@ -10336,8 +10379,8 @@ ORCHESTRATOR_TOOLS = [
 # ═══════════════════════════════════════════════════════════════════
 # Exposes dtt's search + browser stack to any other agent over stdio MCP, so a
 # tool built on a raw Playwright/HTTP interface can borrow SearXNG (with the
-# Notte SERP bridge) and Camoufox instead. Four tools: dtt_search, dtt_fetch,
-# dtt_browser (granular steps), dtt_browser_agent (autonomous). It reuses a real
+# Notte SERP bridge) and Camoufox instead. Tools include search, fetch, browser
+# steps, the autonomous browser agent, and browser session control. It reuses a real
 # Agent in mcp_mode for the proven search/fetch code paths.
 
 BROWSER_MCP_ACTIONS = (
@@ -10372,7 +10415,9 @@ def _browser_mcp_tools(types):
                 "Fetch a URL and return its content. mode='markdown' (default) "
                 "renders in Camoufox and extracts clean article text, clearing "
                 "most bot walls and captchas; mode='text' is a fast no-browser "
-                "fetch; mode='screenshot' saves a PNG and returns its path."
+                "fetch without saved browser logins; mode='screenshot' saves a "
+                "PNG and returns its path. Browser modes share the saved session "
+                "with dtt_browser and dtt_browser_agent."
             ),
             inputSchema={
                 "type": "object",
@@ -10391,7 +10436,9 @@ def _browser_mcp_tools(types):
                 "element ids, then act: click {id}, fill {id, value}, press_key "
                 "{key}, scroll_down/scroll_up {amount?}, go_back, reload, scrape "
                 "(→ page markdown), screenshot (→ PNG path). The session persists "
-                "across calls, so cookies and navigation carry over."
+                "across calls, and saved logins carry over after restart. Uses "
+                "the same session as dtt_fetch and dtt_browser_agent. Use "
+                "dtt_browser_session to let the user log in through a window."
             ),
             inputSchema={
                 "type": "object",
@@ -10407,12 +10454,38 @@ def _browser_mcp_tools(types):
             },
         ),
         types.Tool(
+            name="dtt_browser_session",
+            description=(
+                "Control the shared browser session. action='status' returns "
+                "the session name, display mode, and login handoff state. "
+                "action='open' pauses browser automation and opens a visible "
+                "window for the user to log in (headed defaults to true). "
+                "After the user confirms login, action='resume' saves the "
+                "login and resumes automation. action='close' saves and closes "
+                "the browser. The session stores cookies, localStorage, and "
+                "IndexedDB for reuse across runs. Changing display mode "
+                "restarts the browser and reloads the current URL."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["status", "open", "resume", "close"]},
+                    "session": {"type": "string", "description": "optional saved session name for open"},
+                    "headed": {"type": "boolean", "description": "show the window; open defaults to true; resume keeps the current mode unless set"},
+                    "url": {"type": "string", "description": "optional URL for open"},
+                },
+                "required": ["action"],
+                "additionalProperties": False,
+            },
+        ),
+        types.Tool(
             name="dtt_browser_agent",
             description=(
                 "Hand a natural-language goal to dtt's autonomous browser agent "
                 "(Notte + Camoufox). It drives the whole flow — navigation, "
                 "forms, logins, multi-step interactions — and returns the result "
-                "plus the final page. Its reasoning model requires "
+                "plus the final page. It shares the saved browser session with "
+                "dtt_fetch and dtt_browser. Its reasoning model requires "
                 "OPENROUTER_API_KEY; the other browser tools do not."
             ),
             inputSchema={
@@ -10428,7 +10501,7 @@ def _browser_mcp_tools(types):
     ]
 
 
-async def run_browser_mcp():
+async def run_browser_mcp(browser_session="default", headed=False):
     import mcp.types as types
     import mcp.server.stdio
     from mcp.server import Server
@@ -10437,7 +10510,7 @@ async def run_browser_mcp():
 
     print("▸ Starting dtt browser MCP server (stdio)...", file=sys.stderr)
     agent = Agent(NORMAL_MAIN, NORMAL_ORACLE, api_key, str(Path.cwd()),
-                  mode="normal")
+                  mode="normal", headed=headed, browser_session=browser_session)
     agent._mcp_mode = True
     agent.spinner = Spinner(enabled=False)
 
@@ -10450,7 +10523,7 @@ async def run_browser_mcp():
         await asyncio.sleep(0.1)
         await agent.setup()
         print("  ✓ search + browser stack ready. Tools: dtt_search, dtt_fetch, "
-              "dtt_browser, dtt_browser_agent", file=sys.stderr)
+              "dtt_browser, dtt_browser_session, dtt_browser_agent", file=sys.stderr)
 
     def start_setup():
         nonlocal setup_task
@@ -10466,7 +10539,12 @@ async def run_browser_mcp():
                 installed_pin = marker.read_text(encoding="utf-8").strip()
             except OSError:
                 installed_pin = ""
-            if installed_pin != expected_pin:
+            try:
+                from importlib.metadata import version
+                storage_ready = tuple(int(part) for part in version("playwright").split(".")[:2]) >= (1, 59)
+            except (ImportError, ValueError):
+                storage_ready = False
+            if installed_pin != expected_pin or not storage_ready:
                 install_log = os.environ.get("DTT_NOTTE_INSTALL_LOG", "the DTT Notte install log")
                 try:
                     install_pid = int(os.environ.get("DTT_NOTTE_INSTALL_PID", ""))
@@ -10496,6 +10574,10 @@ async def run_browser_mcp():
                 categories=a.get("categories"), engines=a.get("engines"))
         if name == "dtt_fetch":
             return await agent._tool_fetch_page(a["url"], mode=a.get("mode"))
+        if name == "dtt_browser_session":
+            return await agent._tool_browser_session(
+                a.get("action"), session=a.get("session"),
+                headed=a.get("headed"), url=a.get("url"))
         if name == "dtt_browser_agent":
             if not api_key:
                 raise RuntimeError(
@@ -10560,7 +10642,8 @@ class OrchestratorApp:
     """TUI for managing multiple DTT agent sessions using Textual."""
 
     def __init__(self, api_key, model, cwd, agent_py_path,
-                 notify_desktop=False, notify_email=None):
+                 notify_desktop=False, notify_email=None, browser_session=None,
+                 headed=False):
         self.api_key = api_key
         self.model = model
         self.cwd = cwd
@@ -10574,6 +10657,8 @@ class OrchestratorApp:
         self._launch_lock = asyncio.Lock()
         self._notify_desktop = notify_desktop
         self._notify_email = notify_email
+        self.browser_session = browser_session
+        self.headed = headed
 
     def run(self):
         """Run the orchestrator using Textual TUI."""
@@ -10859,14 +10944,20 @@ class OrchestratorApp:
                     ]
                     if max_loops:
                         cmd.extend(["--max-loops", str(max_loops)])
+                    if orchestrator.browser_session:
+                        cmd.extend(["--browser-session", orchestrator.browser_session])
+                    cmd.append("--headed" if orchestrator.headed else "--headless")
                     if orchestrator._searxng_url:
                         cmd.extend(["--_searxng-url", orchestrator._searxng_url])
 
+                    worker_env = {**os.environ, "OPENROUTER_API_KEY": orchestrator.api_key}
+                    # The explicit worker flags carry the resolved session choice.
+                    worker_env.pop("DTT_BROWSER_SESSION", None)
                     proc = await asyncio.create_subprocess_exec(
                         *cmd,
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
-                        env={**os.environ, "OPENROUTER_API_KEY": orchestrator.api_key},
+                        env=worker_env,
                     )
 
                     session = {
@@ -11251,12 +11342,20 @@ def main():
     parser.add_argument("--max-loops", type=int, default=None,
                         help=f"Maximum agent loops (default: {MAX_LOOPS}, quick mode: {QUICK_MAX_LOOPS})")
     parser.add_argument("--resume", type=str, default=None, metavar="THREAD_ID", help="Resume a previous thread, inheriting its saved config (model, oracle, max-loops, cwd) unless overridden. Optionally combine with --prompt or positional text for fresh instructions")
-    parser.add_argument("--headed", action="store_true", help="Show the browser window for visual debugging")
+    parser.add_argument("--browser-session", default=None, metavar="NAME",
+                        help="Reuse saved browser logins across runs (env: DTT_BROWSER_SESSION). "
+                             "Default: a separate session per thread, or 'default' in MCP mode. "
+                             "Only one process can use a named session at a time.")
+    browser_display = parser.add_mutually_exclusive_group()
+    browser_display.add_argument("--headed", dest="headed", action="store_true", default=None,
+                                 help="Show the browser window, including in MCP mode")
+    browser_display.add_argument("--headless", dest="headed", action="store_false",
+                                 help="Hide the browser window; overrides a resumed thread's setting")
     parser.add_argument("--verbose", action="store_true", help="Verbose error traces")
     parser.add_argument("--show-full", action="store_true", help="Stream the model's thinking live and show full, untruncated tool calls as they start and finish (disables the spinner; a verbose firehose for watching/debugging a run — lets you see what a long-running tool is currently doing)")
     parser.add_argument("--debug", action="store_true", help="Debug-level API payload logging")
     parser.add_argument("--orchestrator", action="store_true", help="Launch orchestrator mode (manage multiple parallel agents)")
-    parser.add_argument("--browsermcp", action="store_true", help="Run a stdio MCP server exposing dtt's search + browser tools (dtt_search, dtt_fetch, dtt_browser, dtt_browser_agent) to another agent")
+    parser.add_argument("--browsermcp", action="store_true", help="Run a stdio MCP server exposing dtt_search, dtt_fetch, dtt_browser, dtt_browser_session, and dtt_browser_agent")
     parser.add_argument("--pipe", action="store_true", help="Pipe mode: final report to stdout, everything else suppressed")
     parser.add_argument("--tui", action="store_true", help="Full-screen terminal UI for single-agent mode (experimental)")
     parser.add_argument("--notify-desktop", action="store_true", help="Send a desktop notification when the task completes")
@@ -11276,7 +11375,9 @@ def main():
     # Browser MCP server: a distinct entrypoint that serves stdio and exits.
     if getattr(args, 'browsermcp', False):
         try:
-            asyncio.run(run_browser_mcp())
+            asyncio.run(run_browser_mcp(
+                browser_session=args.browser_session or os.environ.get("DTT_BROWSER_SESSION") or "default",
+                headed=bool(args.headed)))
         except KeyboardInterrupt:
             pass
         return
@@ -11312,6 +11413,8 @@ def main():
     model, oracle_model = _models_for(mode)
     cwd = str(Path(args.cwd).expanduser().resolve())
     max_loops = args.max_loops  # None until defaulted below (after resume inherit)
+    browser_session = args.browser_session if args.browser_session is not None else os.environ.get("DTT_BROWSER_SESSION") or None
+    headed = args.headed
 
     # On resume, inherit the thread's saved run config unless explicitly overridden
     # on the CLI (so `dtt --resume ID` picks up where it left off, same settings).
@@ -11333,6 +11436,10 @@ def main():
             cwd = str(Path(_rmeta["cwd"]).expanduser().resolve())
         if max_loops is None and _rmeta.get("max_loops"):
             max_loops = _rmeta["max_loops"]
+        if args.browser_session is None and "browser_session" in _rmeta:
+            browser_session = _rmeta["browser_session"]
+        if headed is None:
+            headed = _rmeta.get("headed", False)
         saved_overrides = dict(_rmeta.get("model_overrides") or {})
         if _rmeta:
             print(f"    Inherited config: {mode} mode, "
@@ -11343,6 +11450,7 @@ def main():
 
     if max_loops is None:
         max_loops = QUICK_MAX_LOOPS if quick else MAX_LOOPS
+    headed = bool(headed)
 
     if quick and args.orchestrator:
         print("Error: quick mode (q/--quick) and --orchestrator are mutually exclusive.", file=sys.stderr)
@@ -11412,6 +11520,8 @@ def main():
             agent_py_path=Path(__file__).resolve(),
             notify_desktop=getattr(args, 'notify_desktop', False),
             notify_email=getattr(args, 'notify_email', None),
+            browser_session=browser_session,
+            headed=headed,
         )
         app.run()
         return
@@ -11458,7 +11568,8 @@ def main():
             max_loops=max_loops,
             debug=args.debug,
             verbose=args.verbose,
-            headed=args.headed,
+            headed=headed,
+            browser_session=browser_session,
             resume_id=args.resume,
             worker_mode=is_worker,
             control_file=getattr(args, '_control_file', None),

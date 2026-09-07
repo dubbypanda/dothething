@@ -85,8 +85,10 @@ Everything else is installed automatically into `/tmp/dothething` on first run.
 | `--cwd DIR` | Set the working directory for file operations (default: `.`) |
 | `--max-loops N` | Cap the number of agent turns (default: 200; 15 in quick mode) |
 | `--model [ROLE=]SLUG` | Override the model for a role: `main`, `worker`, `oracle`, or `browser`. Repeatable. A bare slug targets `main`; `ROLE=default` clears a saved or env override |
-| `--resume ID` | Pick up a previous session by thread ID. Inherits that thread's saved config (model, oracle, `--max-loops`, `--cwd`); pass a flag to override it |
-| `--headed` | Show the browser window for visual debugging |
+| `--resume ID` | Pick up a previous session by thread ID. Inherits its saved model, loop limit, working directory, browser session, and display mode; pass a flag to override it |
+| `--browser-session NAME` | Reuse saved browser logins across runs. Defaults to a separate session per thread, or `default` in MCP mode |
+| `--headed` | Show the browser window, including in MCP mode |
+| `--headless` | Hide the browser window; overrides a resumed thread's display mode |
 | `--orchestrator` | Launch orchestrator mode -- run and manage multiple agents from one terminal |
 | `--pipe` | Stdout-only output for Unix pipelines. Final report on stdout, everything else suppressed. Exit codes: 0=complete, 2=partial, 1=failed |
 | `--tui` | Full-screen terminal UI for single-agent mode (experimental) |
@@ -98,6 +100,50 @@ Everything else is installed automatically into `/tmp/dothething` on first run.
 | `--install` | Install the script to `~/.local/bin/dtt`, adding that directory to your PATH if needed |
 | `--update` | Force an update check, bypassing the 6-hour rate limit |
 | `--browsermcp` | Run a stdio MCP server exposing dtt's search + browser tools to another agent |
+
+## Browser sessions and manual login
+
+Use a named session to keep browser logins between runs:
+
+```bash
+dtt --browser-session work --headed "Open https://github.com/login for me to log in. Wait for my confirmation, then list my repositories."
+dtt --browser-session work "List my repositories."
+```
+
+Without a name, each thread keeps its own browser state, which `--resume` restores. Set `DTT_BROWSER_SESSION=work` in your shell or `~/.dtt/env` to choose a default name. An explicit flag takes precedence; a resumed thread keeps its saved selection ahead of the environment default.
+
+The `browser_session` tool opens a window and pauses browser automation while you handle a login or MFA. Leave the window open, then tell the agent when you are done. It calls `browser_session` with `action="resume"` to save the login and continue. `--headed` makes browser windows visible, but does not itself pause automation. Use `--headless` to hide the window on a later run, including a resumed thread that was previously headed.
+
+Page fetches and the autonomous browser agent use the same browser session. The MCP browser tools share it too. Fetch mode `text` starts with a separate HTTP request without saved browser logins and can retry through the browser if the request is blocked. Use mode `markdown` for pages that require your login. The search bridge has its own headless browsers.
+
+Named sessions save cookies, localStorage, and IndexedDB in `~/.dtt/browser-sessions/NAME/storage.json`. These files contain login credentials; dtt restricts file access to your account. This is a storage snapshot, so it does not restore open tabs, sessionStorage, or unfinished forms after a restart. Changing the display mode of an open browser restarts it and reloads the current URL. Some sites can still require a fresh login.
+
+Only one process can use a named session at a time. A second process reports that the session is in use; close the first browser session before retrying. Orchestrator workers inherit the selected name and display mode, so workers that share a name must take turns with the browser.
+
+### Browser MCP server
+
+Add dtt to your MCP client's configuration. Use an absolute path to the installed script if the client does not inherit your shell's PATH:
+
+```json
+{
+  "mcpServers": {
+    "dtt-browser": {
+      "command": "/Users/you/.local/bin/dtt",
+      "args": ["--browsermcp", "--browser-session", "work", "--headed"]
+    }
+  }
+}
+```
+
+MCP mode uses the saved session `default` unless you supply a name through the flag or environment. Omit `--headed` for headless startup; the client can open a window later with `dtt_browser_session`.
+
+For a manual login, the client calls these tools in order, with the user's confirmation between steps 1 and 2:
+
+1. `dtt_browser_session({"action":"open","url":"https://github.com/login"})` opens a visible window and pauses browser automation. Add `"session":"work"` to select another saved session.
+2. `dtt_browser_session({"action":"resume"})` saves the login and resumes automation. Add `"headed":false` to continue headless.
+3. `dtt_browser({"action":"goto","url":"https://github.com/settings/profile"})` uses the login. `dtt_fetch` and `dtt_browser_agent` use the same session.
+
+Call `dtt_browser_session({"action":"status"})` to inspect the current session, or `dtt_browser_session({"action":"close"})` to save it and close the browser. Search, fetch, browser steps, and session control need no OpenRouter key in MCP mode. Only `dtt_browser_agent` requires `OPENROUTER_API_KEY`.
 
 ## How it works
 
@@ -197,7 +243,7 @@ dtt --model main=openai/gpt-5.6-sol --model browser=~anthropic/claude-sonnet-lat
 
 **System:** `run_command`, `shell_session`, `run_code`, `glob`, `list_dir`, `search_file`, `clipboard_copy`, `clipboard_paste`, `computer_use` (macOS GUI control via Peekaboo), `request_user_input`
 
-**Web:** `search_web` (hybrid Serper + SearXNG for general discovery, plus engine/category targeting; general-web engines fetch through Notte), `fetch_page` (Notte-powered scraping), `browser_agent` (full interactive control), `http_request`
+**Web:** `search_web` (hybrid Serper + SearXNG for general discovery, plus engine/category targeting; general-web engines fetch through Notte), `fetch_page` (Notte-powered scraping), `browser_agent` (full interactive control), `browser_session` (saved sessions and manual login), `http_request`
 
 **Analysis:** `think`, `oracle`, `delegate`, `analyze_data`, `analyze_image`, `batch_process`
 
@@ -253,6 +299,7 @@ The agent discovers and uses all tools exposed by connected MCP servers.
 | `DTT_MODEL_WORKER` | No | Default model override for the worker (summaries, delegation, batch) |
 | `DTT_MODEL_ORACLE` | No | Default model override for the oracle |
 | `DTT_MODEL_BROWSER` | No | Default model override for the Notte browser agent |
+| `DTT_BROWSER_SESSION` | No | Named browser session to reuse across runs; an explicit flag or resumed thread's saved selection takes precedence |
 | `SERPER_API_KEY` | No | Enables hybrid `search_web` plus Serper-backed `batch_process` search enrichment |
 | `TWOCAPTCHA_API_KEY` | No | Enables automated captcha solving |
 | `AGENTMAIL_API_KEY` | No | AgentMail key for email tools |
@@ -269,6 +316,7 @@ All variables can be saved to `~/.dtt/env` (shell-exported values take precedenc
 | `~/.dtt/env` | Saved API keys for OpenRouter, Serper, 2Captcha, and AgentMail. Mode 0600. The agent can update this via manage_config. |
 | `~/.dtt/threads/` | Saved conversation threads (resume with `--resume`) |
 | `~/.dtt/threads/<id>/cache/` | Per-thread scratch folder (intermediate files, downloads, batch artifacts) |
+| `~/.dtt/browser-sessions/<name>/storage.json` | Saved browser cookies, localStorage, and IndexedDB for a named session |
 | `~/.dtt/skills/<name>/SKILL.md` | User-defined skills (Claude Code convention) |
 | `~/.dtt/mcp.json` | MCP server configuration |
 | `/tmp/dothething/` | Runtime: Python venv, SearXNG, Camoufox browser |

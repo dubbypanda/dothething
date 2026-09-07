@@ -10,7 +10,7 @@ import sys
 import tempfile
 import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -146,6 +146,10 @@ class FakePage(FakeEvents):
         self.url = "about:blank"
         self.closed = False
         self.front_count = 0
+        self.evaluations = []
+        self.evaluation_value = None
+        self.waits = []
+        self.uploads = []
         self.main_frame = object()
         context.pages.append(self)
 
@@ -161,6 +165,19 @@ class FakePage(FakeEvents):
     async def goto(self, url, **kwargs):
         self.url = url
         self.emit("framenavigated", self.main_frame)
+
+    async def evaluate(self, expression, argument=None):
+        self.evaluations.append((expression, argument))
+        return self.evaluation_value
+
+    async def wait_for_selector(self, selector, **kwargs):
+        self.waits.append((selector, kwargs))
+        return object()
+
+    def locator(self, selector):
+        async def set_input_files(paths, **kwargs):
+            self.uploads.append((selector, paths, kwargs))
+        return types.SimpleNamespace(set_input_files=set_input_files)
 
     async def close(self):
         if self.closed:
@@ -183,6 +200,7 @@ class FakeSession:
         self.exit_count = 0
         self.executions = []
         self.observe_count = 0
+        self._snapshot = None
         self.__class__.instances.append(self)
 
     async def __aenter__(self):
@@ -205,8 +223,17 @@ class FakeSession:
             await self.window.page.goto(kwargs["url"])
         return types.SimpleNamespace(success=True, message="")
 
+    @property
+    def snapshot(self):
+        return self._snapshot
+
+    @snapshot.setter
+    def snapshot(self, value):
+        self._snapshot = value
+
     async def aobserve(self):
         self.observe_count += 1
+        self._snapshot = self.window.page
         return types.SimpleNamespace(space=types.SimpleNamespace(interaction_actions=[]))
 
     async def ascrape(self, **kwargs):
@@ -664,6 +691,206 @@ class BrowserSessionTests(unittest.IsolatedAsyncioTestCase):
         await session.context.close()
         restored = await self.browser(profile_dir=self.profile)._ensure()
         self.assertEqual(restored.context.state, login_state())
+
+    async def test_tab_ids_survive_navigation_and_do_not_cross_contexts(self):
+        browser = self.browser(profile_dir=self.profile)
+        first = (await browser.act("tabs"))["tabs"][0]["tab_id"]
+        second = await browser.act("tab_new", url="https://example.test/second")
+        session = FakeSession.instances[0]
+        self.assertEqual(len(FakeSession.instances), 1)
+        self.assertEqual(len(session.context.pages), 2)
+        active = session.window.page
+        await browser.act("goto", tab_id=first, url="https://example.test/first")
+        self.assertIs(session.window.page, active)
+        tabs = (await browser.act("tabs"))["tabs"]
+        self.assertEqual(tabs, [
+            {"tab_id": first, "url": "https://example.test/first", "active": False},
+            {"tab_id": second["tab_id"], "url": "https://example.test/second", "active": True},
+        ])
+        await browser.act("tab_select", tab_id=first)
+        self.assertIs(session.window.page, session.context.pages[0])
+        await browser.act("tab_close", tab_id=second["tab_id"])
+        third = await browser.act("tab_new")
+        self.assertNotEqual(third["tab_id"], second["tab_id"])
+        with self.assertRaisesRegex(ValueError, "Unknown or closed"):
+            await browser.act("evaluate", tab_id=second["tab_id"], code="42")
+        await browser.close()
+        with self.assertRaisesRegex(ValueError, "Unknown or closed"):
+            await browser.act("tab_select", tab_id=first)
+
+    async def test_external_tab_close_preserves_other_tabs_and_context(self):
+        browser = self.browser(profile_dir=self.profile)
+        first = (await browser.act("tabs"))["tabs"][0]["tab_id"]
+        second = await browser.act("tab_new")
+        session = FakeSession.instances[0]
+        await session.window.page.close()
+        tabs = (await browser.act("tabs"))["tabs"]
+        self.assertEqual(tabs, [{"tab_id": first, "url": "about:blank", "active": True}])
+        self.assertEqual(len(FakeSession.instances), 1)
+        with self.assertRaisesRegex(ValueError, "Unknown or closed"):
+            await browser.act("tab_select", tab_id=second["tab_id"])
+
+    async def test_last_tab_close_keeps_saved_context_open(self):
+        browser = self.browser(profile_dir=self.profile)
+        first = (await browser.act("tabs"))["tabs"][0]["tab_id"]
+        session = FakeSession.instances[0]
+        session.context.state = login_state()
+        await browser.act("tab_close", tab_id=first)
+        replacement = (await browser.act("tabs"))["tabs"]
+        self.assertEqual(len(replacement), 1)
+        self.assertNotEqual(replacement[0]["tab_id"], first)
+        self.assertTrue(replacement[0]["active"])
+        self.assertEqual(session.context.state, login_state())
+        self.assertEqual(len(FakeSession.instances), 1)
+
+    async def test_observed_ids_remain_attached_to_their_tab(self):
+        browser = self.browser(profile_dir=self.profile)
+        first = (await browser.act("tabs"))["tabs"][0]["tab_id"]
+        session = FakeSession.instances[0]
+        first_page = session.window.page
+        await browser.act("observe")
+        second = await browser.act("tab_new", url="https://example.test/same")
+        second_page = session.window.page
+        self.assertIsNone(session.snapshot)
+        await browser.act("observe")
+        self.assertIs(session.snapshot, second_page)
+        await browser.act("observe", tab_id=first)
+        self.assertIs(session.window.page, second_page)
+        self.assertIs(session.snapshot, second_page)
+        await browser.act("tab_select", tab_id=first)
+        self.assertIs(session.snapshot, first_page)
+        await browser.act("tab_select", tab_id=second["tab_id"])
+        self.assertIs(session.snapshot, second_page)
+
+    async def test_explicit_tab_restores_selection_after_notte_error(self):
+        browser = self.browser(profile_dir=self.profile)
+        first = (await browser.act("tabs"))["tabs"][0]["tab_id"]
+        await browser.act("tab_new")
+        session = FakeSession.instances[0]
+        active = session.window.page
+        with patch.object(session, "aexecute", AsyncMock(side_effect=RuntimeError("page error"))):
+            with self.assertRaisesRegex(RuntimeError, "page error"):
+                await browser.act("goto", tab_id=first, url="https://example.test")
+        self.assertIs(session.window.page, active)
+
+    async def test_evaluate_preserves_json_values_and_unicode_script_argument(self):
+        browser = self.browser(profile_dir=self.profile)
+        session = await browser._ensure()
+        code = "window.payload=" + json.dumps("🦕 māori" * 20000) + ";window.payload"
+        self.assertGreater(len(code), 180000)
+        for value in (None, True, False, 42, "māori 🦕", [1, "two"], {"full": "ä" * 100000}):
+            with self.subTest(value_type=type(value).__name__):
+                session.window.page.evaluation_value = value
+                result = await browser.act("evaluate", code=code)
+                self.assertEqual(result, {"value": value})
+                self.assertEqual(session.window.page.evaluations[-1], ("code => (0, eval)(code)", code))
+                self.assertEqual(json.loads(json.dumps(result)), result)
+        session.window.page.evaluation_value = float("nan")
+        with self.assertRaises(ValueError):
+            await browser.act("evaluate", code="NaN")
+
+    async def test_wait_and_upload_target_native_page_without_changing_active_tab(self):
+        browser = self.browser(profile_dir=self.profile)
+        first = (await browser.act("tabs"))["tabs"][0]["tab_id"]
+        session = FakeSession.instances[0]
+        upload_page = session.window.page
+        await browser.act("tab_new")
+        active = session.window.page
+        file = self.root / "media file.txt"
+        file.write_text("article media")
+        wait = await browser.act("wait_for", tab_id=first, selector="#editor", timeout_ms=1234)
+        result = await browser.act("upload_files", tab_id=first, selector="input[type=file]", paths=[str(file)])
+        self.assertTrue(wait["found"])
+        self.assertEqual(upload_page.waits, [("#editor", {"timeout": 1234})])
+        self.assertEqual(upload_page.uploads, [("input[type=file]", [str(file)], {"timeout": 30000})])
+        self.assertEqual(result["uploaded"], [str(file)])
+        self.assertIs(session.window.page, active)
+        self.assertEqual(active.uploads, [])
+
+    async def test_new_operations_obey_manual_and_login_pause_guards(self):
+        browser = self.browser(profile_dir=self.profile)
+        await browser.control("open")
+        actions = [
+            ("tabs", {}), ("tab_new", {}), ("tab_select", {"tab_id": "tab-1"}),
+            ("tab_close", {"tab_id": "tab-1"}), ("evaluate", {"code": "42"}),
+            ("wait_for", {"selector": "body"}),
+            ("upload_files", {"selector": "input", "paths": [str(self.root / "none")]}),
+        ]
+        for login_state_value in (None, "waiting_for_close"):
+            browser._login_state = login_state_value
+            for action, params in actions:
+                with self.subTest(action=action, login=login_state_value):
+                    with self.assertRaisesRegex(RuntimeError, "paused"):
+                        await browser.act(action, **params)
+        self.assertEqual(len(FakeSession.instances[0].context.pages), 1)
+
+    async def test_invalid_browser_arguments_fail_before_browser_start(self):
+        browser = self.browser(profile_dir=self.profile)
+        invalid = [
+            ("evaluate", {}), ("evaluate", {"code": 42}), ("evaluate", {"code": ""}),
+            ("tab_select", {}), ("tab_close", {"tab_id": 1}),
+            ("tab_new", {"tab_id": "tab-1"}), ("tabs", {"unknown": True}),
+            ("wait_for", {"selector": "body", "timeout_ms": True}),
+            ("wait_for", {"selector": "body", "timeout_ms": 0}),
+            ("wait_for", {"selector": "body", "timeout_ms": 120001}),
+            ("upload_files", {"selector": "input", "paths": "file.txt"}),
+            ("upload_files", {"selector": "input", "paths": []}),
+            ("upload_files", {"selector": "input", "paths": ["relative.txt"]}),
+            ("upload_files", {"selector": "input", "paths": [str(self.root)]}),
+            ("upload_files", {"selector": "input", "paths": [str(self.root / "missing")]}),
+            ("goto", {"url": None}), ("scroll_down", {"amount": False}),
+        ]
+        for action, params in invalid:
+            with self.subTest(action=action, params=params):
+                with self.assertRaises(ValueError):
+                    await browser.act(action, **params)
+        self.assertEqual(FakeSession.instances, [])
+
+    async def test_observation_limits_report_truncation_without_invalid_json(self):
+        browser = self.browser(profile_dir=self.profile)
+        session = await browser._ensure()
+        elements = [types.SimpleNamespace(id=f"item-{i}", description="ä" * 200) for i in range(205)]
+        observation = types.SimpleNamespace(space=types.SimpleNamespace(interaction_actions=elements))
+        with patch.object(session, "aobserve", AsyncMock(return_value=observation)):
+            result = await browser.act("observe")
+        self.assertTrue(result["truncated"])
+        self.assertEqual(result["element_count"], 205)
+        self.assertEqual(len(result["elements"]), 200)
+        with patch.object(session, "ascrape", AsyncMock(return_value="x" * 60000)):
+            result = await browser.act("scrape")
+        self.assertEqual(len(result["markdown"]), 50000)
+        self.assertEqual(result["character_count"], 60000)
+        self.assertTrue(result["truncated"])
+        self.assertEqual(json.loads(json.dumps(result)), result)
+
+    async def test_evaluation_holds_operation_lock_until_complete(self):
+        browser = self.browser(profile_dir=self.profile)
+        session = await browser._ensure()
+        started = asyncio.Event()
+        release = asyncio.Event()
+        async def evaluate(*args):
+            started.set()
+            await release.wait()
+            return "complete"
+        with patch.object(session.window.page, "evaluate", evaluate):
+            active = asyncio.create_task(browser.act("evaluate", code="42"))
+            await started.wait()
+            second = asyncio.create_task(browser.act("tab_new"))
+            await asyncio.sleep(0)
+            self.assertFalse(second.done())
+            self.assertEqual(len(session.context.pages), 1)
+            release.set()
+            await asyncio.wait_for(asyncio.gather(active, second), timeout=1)
+
+    def test_mcp_exposes_tab_and_dom_operations(self):
+        tools = self.code["_browser_mcp_tools"](types.SimpleNamespace(Tool=types.SimpleNamespace))
+        tool = next(tool for tool in tools if tool.name == "dtt_browser")
+        properties = tool.inputSchema["properties"]
+        for action in ("evaluate", "tabs", "tab_new", "tab_select", "tab_close", "wait_for", "upload_files"):
+            self.assertIn(action, properties["action"]["enum"])
+        self.assertEqual(properties["paths"]["items"]["type"], "string")
+        self.assertEqual(properties["timeout_ms"]["maximum"], 120000)
+        self.assertFalse(tool.inputSchema["additionalProperties"])
 
     def test_mcp_exposes_login_monitor_controls(self):
         tools = self.code["_browser_mcp_tools"](types.SimpleNamespace(Tool=types.SimpleNamespace))

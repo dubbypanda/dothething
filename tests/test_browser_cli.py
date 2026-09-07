@@ -135,6 +135,44 @@ class BrowserCliTests(unittest.TestCase):
         self.assertTrue(options["headed"])
 
 
+class BrowserMcpDispatchTests(unittest.IsolatedAsyncioTestCase):
+    @classmethod
+    def setUpClass(cls):
+        source = (ROOT / "dtt.sh").read_text().split("<< 'PYTHON_AGENT'\n", 1)[1]
+        tree = ast.parse(source.split("\nPYTHON_AGENT", 1)[0])
+        server = next(node for node in tree.body
+                      if isinstance(node, ast.AsyncFunctionDef) and node.name == "run_browser_mcp")
+        dispatch = next(node for node in server.body
+                        if isinstance(node, ast.AsyncFunctionDef) and node.name == "dispatch")
+        actions = next(node for node in tree.body if isinstance(node, ast.Assign)
+                       and any(isinstance(target, ast.Name) and target.id == "BROWSER_MCP_ACTIONS"
+                               for target in node.targets))
+        cls.dispatch_code = compile(ast.Module(body=[actions, dispatch], type_ignores=[]), "dtt.sh", "exec")
+
+    async def test_large_evaluation_request_and_result_are_complete_json(self):
+        script = "window.article=" + json.dumps("māori 🦕" * 20000) + ";window.article"
+        payload = {"value": {"body": "māori 🦕" * 20000, "end": True}}
+        self.assertGreater(len(script), 180000)
+        browser = types.SimpleNamespace(act=AsyncMock(return_value=payload))
+        namespace = {"agent": types.SimpleNamespace(browser=browser), "json": json}
+        exec(self.dispatch_code, namespace)
+        encoded = await namespace["dispatch"]("dtt_browser", {
+            "action": "evaluate", "code": script, "tab_id": "tab-2",
+        })
+        self.assertGreater(len(encoded), 100000)
+        self.assertEqual(json.loads(encoded), payload)
+        self.assertIn("māori 🦕", encoded)
+        browser.act.assert_awaited_once_with("evaluate", code=script, tab_id="tab-2")
+
+    async def test_native_upload_arguments_reach_browser_unchanged(self):
+        browser = types.SimpleNamespace(act=AsyncMock(return_value={"uploaded": ["/tmp/media file.png"]}))
+        namespace = {"agent": types.SimpleNamespace(browser=browser), "json": json}
+        exec(self.dispatch_code, namespace)
+        params = {"selector": "input[type=file]", "paths": ["/tmp/media file.png"], "tab_id": "tab-1"}
+        await namespace["dispatch"]("dtt_browser", {"action": "upload_files", **params})
+        browser.act.assert_awaited_once_with("upload_files", **params)
+
+
 class BrowserLoginGateTests(unittest.IsolatedAsyncioTestCase):
     @classmethod
     def setUpClass(cls):

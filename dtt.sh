@@ -1963,6 +1963,9 @@ class Browser:
         self._login_error = None
         self._login_url = None
         self._last_url = None
+        self._tabs = {}
+        self._next_tab_id = 1
+        self._tab_snapshots = {}
         self.session_name = None
         self._profile_dir = Path(profile_dir) if profile_dir else None
         if session_name is not None:
@@ -2068,7 +2071,11 @@ class Browser:
     async def _ensure(self):
         async with self._lock:
             if self._session is not None and self._session.window.page.is_closed():
-                await self._close_session(release_lock=False)
+                pages = [page for page in self._session.window.page.context.pages if not page.is_closed()]
+                if pages:
+                    self._select_page(self._session, pages[-1])
+                else:
+                    await self._close_session(release_lock=False)
             if self._session is None:
                 self._acquire_profile_lock()
                 session = None
@@ -2124,6 +2131,8 @@ class Browser:
                 self._legacy_state_file = self._legacy_cookie_file = None
         finally:
             self._session = None
+            self._tabs.clear()
+            self._tab_snapshots.clear()
             if release_lock:
                 self._release_profile_lock()
 
@@ -2653,55 +2662,172 @@ class Browser:
                 "status": int(payload.get("status") or 200),
             }
 
-    async def act(self, action, **params):
-        """Granular step against the persistent session, for the browser MCP.
+    def _sync_tabs(self, session):
+        pages = [page for page in session.window.page.context.pages if not page.is_closed()]
+        self._tabs = {key: page for key, page in self._tabs.items() if page in pages}
+        self._tab_snapshots = {page: snapshot for page, snapshot in self._tab_snapshots.items() if page in pages}
+        for page in pages:
+            if page not in self._tabs.values():
+                self._tabs[f"tab-{self._next_tab_id}"] = page
+                self._next_tab_id += 1
+        return self._tabs
 
-        Thin wrapper over Notte's own execute/observe/scrape so a calling agent
-        can drive a real browser step by step. Returns a dict; callers serialise
-        it. `observe` returns the interactable element map (ids to act on).
+    def _tab_id(self, page):
+        return next(key for key, candidate in self._tabs.items() if candidate is page)
+
+    def _select_page(self, session, page):
+        previous = session.window.page
+        if previous is page:
+            return
+        # Notte resolves observed element IDs through its current snapshot.
+        # Preserve each tab's map so equal URLs cannot resolve another tab's ID.
+        if hasattr(session, "_snapshot"):
+            self._tab_snapshots[previous] = session._snapshot
+            session.snapshot = self._tab_snapshots.get(page)
+        session.window.page = page
+
+    @staticmethod
+    def _validate_action(action, params):
+        if action not in BROWSER_MCP_ACTIONS:
+            raise ValueError(f"Unknown browser action '{action}'.")
+        allowed = {
+            "goto": ("url",), "observe": (), "click": ("id",),
+            "fill": ("id", "value"), "press_key": ("key",),
+            "scroll_down": ("amount",), "scroll_up": ("amount",),
+            "go_back": (), "reload": (), "scrape": ("only_main_content",),
+            "screenshot": ("dir", "full_page"), "evaluate": ("code",),
+            "tabs": (), "tab_new": ("url",), "tab_select": (), "tab_close": (),
+            "wait_for": ("selector", "timeout_ms"),
+            "upload_files": ("selector", "paths", "timeout_ms"),
+        }
+        permitted = set(allowed[action])
+        if action not in ("tabs", "tab_new"):
+            permitted.add("tab_id")
+        unexpected = set(params) - permitted
+        if unexpected:
+            raise ValueError(f"Invalid parameters for {action}: {', '.join(sorted(unexpected))}.")
+        required = {
+            "goto": ("url",), "click": ("id",), "fill": ("id", "value"),
+            "press_key": ("key",), "evaluate": ("code",),
+            "tab_select": ("tab_id",), "tab_close": ("tab_id",),
+            "wait_for": ("selector",), "upload_files": ("selector", "paths"),
+        }
+        for key in required.get(action, ()):
+            if key not in params:
+                raise ValueError(f"{key} is required for {action}.")
+        for key, value in params.items():
+            if key in ("url", "id", "key", "code", "selector", "tab_id", "dir", "value"):
+                if not isinstance(value, str) or (key != "value" and not value.strip()):
+                    raise ValueError(f"{key} must be a {'non-empty ' if key != 'value' else ''}string.")
+            elif key in ("timeout_ms", "amount"):
+                if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                    raise ValueError(f"{key} must be a positive integer.")
+                if key == "timeout_ms" and value > 120000:
+                    raise ValueError("timeout_ms must be at most 120000.")
+            elif key in ("only_main_content", "full_page") and not isinstance(value, bool):
+                raise ValueError(f"{key} must be a boolean.")
+            elif key == "paths":
+                if not isinstance(value, list) or not value:
+                    raise ValueError("paths must be a non-empty list of absolute file paths.")
+                for path in value:
+                    if not isinstance(path, str) or not Path(path).is_absolute():
+                        raise ValueError("Each upload path must be an absolute file path.")
+                    if not Path(path).is_file():
+                        raise ValueError(f"Upload file does not exist or is not a file: {path}")
+
+    async def act(self, action, **params):
+        """Run one browser operation in the saved context, serialised with login.
+
+        Explicit tab_id addresses a tab without changing the default. tab_new
+        and tab_select change the default. IDs survive navigation and are never
+        reused; a browser restart invalidates them. Evaluate uses JavaScript
+        script completion semantics, including the last expression's value.
         """
         async with self._operation_lock:
             self._check_automation()
+            self._validate_action(action, params)
             session = await self._ensure()
-            if action == "observe":
-                obs = await session.aobserve()
-                els = []
-                space = getattr(obs, "space", None)
-                for a in (getattr(space, "interaction_actions", None) or []):
-                    els.append({
-                        "id": getattr(a, "id", None),
-                        "description": getattr(a, "description", "") or "",
-                        "type": type(a).__name__,
-                    })
-                page = session.window.page if session.window else None
-                return {"url": getattr(page, "url", ""),
-                        "title": (await page.title()) if page else "",
-                        "elements": els[:200], "element_count": len(els)}
-
-            if action == "scrape":
-                md = await session.ascrape(only_main_content=params.get("only_main_content", True))
-                page = session.window.page if session.window else None
-                return {"url": getattr(page, "url", ""), "markdown": (md or "")[:50000]}
-
+            self._sync_tabs(session)
+            previous = session.window.page
+            tab_id = params.pop("tab_id", None)
+            if tab_id is not None and tab_id not in self._tabs:
+                raise ValueError(f"Unknown or closed browser tab: {tab_id}")
+            page = self._tabs[tab_id] if tab_id else previous
+            if action == "tabs":
+                return {"tabs": [{"tab_id": key, "url": tab.url, "active": tab is previous}
+                                 for key, tab in self._tabs.items()]}
+            if action == "tab_new":
+                page = await previous.context.new_page()
+                self._sync_tabs(session)
+                self._select_page(session, page)
+                if params.get("url"):
+                    await page.goto(params["url"], wait_until="domcontentloaded")
+                return {"tab_id": self._tab_id(page), "url": page.url}
+            if action == "tab_select":
+                self._select_page(session, page)
+                return {"tab_id": tab_id, "url": page.url}
+            if action == "tab_close":
+                # Keep the context alive when its final tab is closed.
+                if len(self._tabs) == 1:
+                    replacement = await page.context.new_page()
+                else:
+                    replacement = next(tab for tab in self._tabs.values() if tab is not page)
+                if page is previous:
+                    self._select_page(session, replacement)
+                await page.close()
+                self._sync_tabs(session)
+                return {"tab_id": tab_id, "closed": True}
+            if action == "evaluate":
+                value = await page.evaluate("code => (0, eval)(code)", params["code"])
+                # Reject values that JSON cannot represent instead of returning
+                # invalid JSON or silently stringifying page objects.
+                json.dumps(value, allow_nan=False)
+                return {"value": value}
+            if action == "wait_for":
+                await page.wait_for_selector(params["selector"], timeout=params.get("timeout_ms", 30000))
+                return {"tab_id": self._tab_id(page), "url": page.url, "found": True}
+            if action == "upload_files":
+                await page.locator(params["selector"]).set_input_files(
+                    params["paths"], timeout=params.get("timeout_ms", 30000))
+                return {"tab_id": self._tab_id(page), "url": page.url, "uploaded": params["paths"]}
             if action == "screenshot":
                 out_dir = params.get("dir") or str(BASE / "screenshots")
                 Path(out_dir).mkdir(parents=True, exist_ok=True)
                 path = str(Path(out_dir) / f"browser_{int(time.time()*1000)}.png")
-                data = await session.window.page.screenshot(full_page=params.get("full_page", False))
+                data = await page.screenshot(full_page=params.get("full_page", False))
                 Path(path).write_bytes(data)
                 return {"screenshot": path}
 
-            # Everything else maps to a Notte execute action. Notte validates
-            # the type and params and returns a result with .success/.message.
-            exec_kwargs = {"type": action}
-            exec_kwargs.update({k: v for k, v in params.items() if v is not None})
-            result = await session.aexecute(**exec_kwargs)
-            page = session.window.page if session.window else None
-            return {
-                "success": bool(getattr(result, "success", True)),
-                "message": getattr(result, "message", "") or "",
-                "url": getattr(page, "url", "") if page else "",
-            }
+            self._select_page(session, page)
+            try:
+                if action == "observe":
+                    obs = await session.aobserve()
+                    els = []
+                    space = getattr(obs, "space", None)
+                    for a in (getattr(space, "interaction_actions", None) or []):
+                        els.append({
+                            "id": getattr(a, "id", None),
+                            "description": getattr(a, "description", "") or "",
+                            "type": type(a).__name__,
+                        })
+                    return {"url": page.url, "title": await page.title(),
+                            "elements": els[:200], "element_count": len(els),
+                            "truncated": len(els) > 200}
+                if action == "scrape":
+                    md = await session.ascrape(only_main_content=params.get("only_main_content", True))
+                    md = md or ""
+                    return {"url": page.url, "markdown": md[:50000],
+                            "character_count": len(md), "truncated": len(md) > 50000}
+                result = await session.aexecute(type=action, **params)
+                return {
+                    "success": bool(getattr(result, "success", True)),
+                    "message": getattr(result, "message", "") or "",
+                    "url": session.window.page.url,
+                }
+            finally:
+                if tab_id is not None and not previous.is_closed():
+                    self._select_page(session, previous)
+                self._sync_tabs(session)
 
     async def agent(self, task, url=None, max_steps=20):
         async with self._operation_lock:
@@ -10583,6 +10709,7 @@ ORCHESTRATOR_TOOLS = [
 BROWSER_MCP_ACTIONS = (
     "goto", "observe", "click", "fill", "press_key",
     "scroll_down", "scroll_up", "go_back", "reload", "scrape", "screenshot",
+    "evaluate", "tabs", "tab_new", "tab_select", "tab_close", "wait_for", "upload_files",
 )
 
 
@@ -10637,7 +10764,14 @@ def _browser_mcp_tools(types):
                 "action='goto' {url}, then action='observe' to get interactable "
                 "element ids, then act: click {id}, fill {id, value}, press_key "
                 "{key}, scroll_down/scroll_up {amount?}, go_back, reload, scrape "
-                "(→ page markdown), screenshot (→ PNG path). The session persists "
+                "(→ page markdown), screenshot (→ PNG path). evaluate {code} returns "
+                "{value} with the JavaScript script's last expression, including full JSON. "
+                "tabs lists stable tab_id values; tab_new {url?} opens and selects a tab; "
+                "tab_select/tab_close {tab_id} select or close it. An optional tab_id on "
+                "other actions targets that tab without changing the default. All tabs "
+                "share this saved context. wait_for {selector, timeout_ms?} waits for a "
+                "visible element; upload_files {selector, paths} sets an input's files "
+                "from absolute local paths. The session persists "
                 "across calls, and saved logins carry over after restart. Uses "
                 "the same session as dtt_fetch and dtt_browser_agent. When login "
                 "or MFA needs the user, call dtt_browser_session(action='login', url=login_url) "
@@ -10649,13 +10783,22 @@ def _browser_mcp_tools(types):
                 "type": "object",
                 "properties": {
                     "action": {"type": "string", "enum": list(BROWSER_MCP_ACTIONS)},
-                    "url": {"type": "string", "description": "for goto"},
+                    "url": {"type": "string", "minLength": 1, "description": "for goto or tab_new"},
+                    "tab_id": {"type": "string", "minLength": 1, "description": "stable ID from tabs or tab_new; required for tab_select/tab_close"},
+                    "code": {"type": "string", "minLength": 1, "description": "JavaScript script for evaluate; last expression is returned as value"},
+                    "selector": {"type": "string", "minLength": 1, "description": "CSS selector for wait_for or upload_files"},
+                    "paths": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}, "description": "absolute local file paths for upload_files"},
+                    "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 120000, "default": 30000},
+                    "only_main_content": {"type": "boolean", "description": "for scrape, default true"},
+                    "full_page": {"type": "boolean", "description": "for screenshot, default false"},
+                    "dir": {"type": "string", "minLength": 1, "description": "output directory for screenshot"},
                     "id": {"type": "string", "description": "element id from observe, for click/fill"},
                     "value": {"type": "string", "description": "text, for fill"},
                     "key": {"type": "string", "description": "key name, for press_key"},
-                    "amount": {"type": "integer", "description": "pixels, for scroll"},
+                    "amount": {"type": "integer", "minimum": 1, "description": "pixels, for scroll"},
                 },
                 "required": ["action"],
+                "additionalProperties": False,
             },
         ),
         types.Tool(
@@ -10807,19 +10950,9 @@ async def run_browser_mcp(browser_session="default", headed=False):
             action = a.get("action")
             if action not in BROWSER_MCP_ACTIONS:
                 return f"Error: unknown action '{action}'. Valid: {', '.join(BROWSER_MCP_ACTIONS)}."
-            params = {}
-            if action == "goto":
-                params["url"] = a.get("url")
-            elif action in ("click", "fill"):
-                params["id"] = a.get("id")
-                if action == "fill":
-                    params["value"] = a.get("value")
-            elif action == "press_key":
-                params["key"] = a.get("key")
-            elif action in ("scroll_down", "scroll_up") and a.get("amount"):
-                params["amount"] = a.get("amount")
+            params = {key: value for key, value in a.items() if key != "action"}
             result = await agent.browser.act(action, **params)
-            return json.dumps(result, indent=1, default=str)[:20000]
+            return json.dumps(result, ensure_ascii=False, allow_nan=False)
         return f"Error: unknown tool '{name}'."
 
     @server.call_tool()

@@ -41,19 +41,19 @@ Omit `--prompt` to open a multiline editor. Type your task, then hit Esc+Enter t
 
 ## Modes
 
-dtt has three modes. **Normal** is the default: cheap, fast models (DeepSeek V4 Flash for the agent, Gemini Flash for the worker, Claude Sonnet for the browser, GPT-5.6 Terra for the oracle) at `xhigh` reasoning, with the full toolset. It handles most work.
+dtt has three modes. **Normal** is the default: cheap, fast models (DeepSeek Flash for the agent, Gemini Flash for the worker, Claude Sonnet for the browser, GPT-5.6 Terra for the oracle) at `xhigh` reasoning, with the full toolset. It handles most work.
 
 ```bash
 dtt "research the 10 largest data breaches of 2025 and summarise the causes"
 ```
 
-**Advanced** (`--advanced`) swaps in the strongest models (Claude Fable 5 plus the GPT-5.6 Sol oracle) at `max` reasoning. Reach for it on genuinely hard tasks; it is slower and costs more.
+**Advanced** (`--advanced`) swaps in the strongest models (Claude Fable plus the Astra oracle) at `max` reasoning. Use it for hard tasks; it is slower and costs more.
 
 ```bash
 dtt --advanced "audit this codebase for concurrency bugs and propose fixes"
 ```
 
-**Quick** (`q`, or `-q`/`--quick`) is for a fast answer, not a research project. It one-shots on a fast frontier model (Claude Opus 5 Fast), with a trimmed toolset: no oracle, no plan or notes bookkeeping, no batch machinery, and skills stay out of the prompt until invoked. Its first reply stacks every tool call the job needs, staged with `exec_order` where order matters, and the next reply is the answer. The loop cap drops to 15 turns.
+**Quick** (`q`, or `-q`/`--quick`) is for a fast answer, not a research project. It one-shots on a fast frontier model (Claude Opus Fast), with a trimmed toolset: no oracle, no plan or notes bookkeeping, no batch machinery, and skills stay out of the prompt until invoked. Its first reply stacks every tool call the job needs, staged with `exec_order` where order matters, and the next reply is the answer. The loop cap drops to 15 turns.
 
 ```bash
 dtt q "what's the weather like in Cape Town today"
@@ -80,7 +80,7 @@ Everything else is installed automatically into `/tmp/dothething` on first run.
 | Flag | What it does |
 |---|---|
 | `q` (or `-q`, `--quick`) | Quick mode: one-shot on a fast frontier model with a trimmed toolset and no oracle |
-| `--advanced` | Advanced mode: strongest models (Fable + GPT-5.6 Sol) at max reasoning, for hard tasks |
+| `--advanced` | Advanced mode: strongest models (Fable + Astra) at max reasoning, for hard tasks |
 | `--prompt "..."` | Provide the task inline instead of opening the editor |
 | `--cwd DIR` | Set the working directory for file operations (default: `.`) |
 | `--max-loops N` | Cap the number of agent turns (default: 200; 15 in quick mode) |
@@ -220,13 +220,13 @@ All calls route through OpenRouter. You only need one API key. The default slugs
 
 | Role | Normal (default) | Advanced (`--advanced`) |
 |---|---|---|
-| Main agent (`main`) | DeepSeek V4 Flash | Claude Fable 5 |
+| Main agent (`main`) | DeepSeek Flash | Claude Fable |
 | Worker: summaries, analysis, delegation (`worker`) | Gemini Flash | Gemini Flash |
-| Browser agent, Notte (`browser`) | Claude Sonnet | Claude Fable 5 |
-| Oracle (`oracle`) | GPT-5.6 Terra | GPT-5.6 Sol |
+| Browser agent, Notte (`browser`) | Claude Sonnet | Claude Fable |
+| Oracle (`oracle`) | GPT-5.6 Terra | Astra |
 | Perception (Notte vision) | Gemini Flash | Gemini Flash |
 
-Quick mode (`q`) runs the agent on Claude Opus 5 Fast with no oracle. Any role is overridable with `--model role=slug` or `DTT_MODEL_*`.
+Quick mode (`q`) runs the agent on Claude Opus Fast with no oracle. Any role is overridable with `--model role=slug` or `DTT_MODEL_*`.
 
 ### Reasoning effort
 
@@ -240,7 +240,7 @@ Any of the four roles can be swapped for a different OpenRouter model with `--mo
 dtt --model oracle=x-ai/grok-5 "..."                         # different oracle
 dtt --model worker=google/gemini-flash-lite-latest "..."     # cheaper worker
 dtt --model anthropic/claude-opus-5 "..."                    # bare slug targets main
-dtt --model main=openai/gpt-5.6-sol --model browser=~anthropic/claude-sonnet-latest "..."
+dtt --model main=openai/gpt-6-astra --model browser=~anthropic/claude-sonnet-latest "..."
 ```
 
 `--model` beats the mode defaults. A resumed thread keeps its overrides unless you pass new ones, and `--model oracle=default` clears one. To make an override permanent, set `DTT_MODEL_MAIN`, `DTT_MODEL_WORKER`, `DTT_MODEL_ORACLE`, or `DTT_MODEL_BROWSER` in `~/.dtt/env`; CLI flags win over env vars. Orchestrator workers inherit whatever overrides are in effect.

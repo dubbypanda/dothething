@@ -606,8 +606,8 @@
                     <div class="visual-col" vid="56">
                         <div class="visual-meta" vid="57">
                             Oracle<br vid="58">
-                            <strong vid="59">GPT-5.6</strong>
-                            a stronger second opinion when stuck
+                            <strong vid="59">GPT-5.6 Terra</strong>
+                            Astra in advanced mode
                         </div>
                         <div class="orb-stack" vid="60">
                             <div class="orb" vid="61">
@@ -671,7 +671,7 @@
                             <li><strong>Stacked Tool Calls</strong>
                             Many tool calls per reply, all parallel by default. An optional <code>exec_order</code> field sequences them into stages: calls sharing a number run together, and the next stage waits for the previous one to finish. "Make a directory, write three files into it, list it" is one round-trip instead of three. If a whole stage fails, everything after it is skipped.</li>
                             <li><strong>Browser Automation</strong>
-                            Notte + Camoufox (stealth Firefox) under the hood. <code>fetch_page</code> pulls clean markdown, no LLM cost. Captchas get solved in the background. For login flows or multi-step SPAs, <code>browser_agent</code> hands the session off to a Sonnet-powered browser agent.</li>
+                            Notte + Camoufox (stealth Firefox) under the hood. <code>fetch_page</code> pulls clean markdown, no LLM cost. Captchas get solved in the background. For login flows or multi-step SPAs, <code>browser_agent</code> uses Claude Sonnet by default, or Claude Fable in advanced mode.</li>
                             <li><strong>Orchestrator Mode</strong>
                             <code>--orchestrator</code> opens a Textual terminal UI for running multiple agents in parallel. One line per session showing status, phase, elapsed time, and cost. Expand any session to watch its log, send input, terminate, or copy output. A smart launcher takes your prompt, has Fable split the work, and spins up to 16 concurrent agents. Shows a cost estimate before launch.</li>
                             <li><strong>Live Input</strong>
@@ -683,7 +683,7 @@
                     <div class="col-6">
                         <ul class="feature-list">
                             <li><strong>Three Modes</strong>
-                            Normal is the default: cheap, fast models at high reasoning, full toolset. <code>--advanced</code> swaps in the strongest models (Claude Fable 5, a GPT-5.6 Sol oracle) at max reasoning for hard tasks. <code>dtt q "..."</code> is quick mode: a one-shot on a fast frontier model, no oracle, trimmed toolset, done in about two turns.</li>
+                            Normal mode runs DeepSeek Flash at <code>xhigh</code> reasoning with the full toolset and a GPT-5.6 Terra oracle. <code>--advanced</code> uses Claude Fable with an Astra oracle at <code>max</code> reasoning. <code>dtt q "..."</code> uses Claude Opus Fast with a trimmed toolset and no oracle, usually in about two turns.</li>
                             <li><strong>Model Defaults, Live</strong>
                             The model for each role is read from <code>dotheth.ing/models.txt</code>, fetched once a day. Defaults change without a new release. Override any role per run with <code>--model role=slug</code> or the <code>DTT_MODEL_*</code> env vars.</li>
                             <li><strong>Thread Persistence</strong>

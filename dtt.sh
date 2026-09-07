@@ -2739,7 +2739,8 @@ class Browser:
         """Run one browser operation in the saved context, serialised with login.
 
         Explicit tab_id addresses a tab without changing the default. tab_new
-        and tab_select change the default. IDs survive navigation and are never
+        and tab_select change the default. tab_new returns at navigation commit;
+        callers wait for the required page state separately. IDs survive navigation and are never
         reused; a browser restart invalidates them. Evaluate uses JavaScript
         script completion semantics, including the last expression's value.
         """
@@ -2761,7 +2762,7 @@ class Browser:
                 self._sync_tabs(session)
                 self._select_page(session, page)
                 if params.get("url"):
-                    await page.goto(params["url"], wait_until="domcontentloaded")
+                    await page.goto(params["url"], wait_until="commit")
                 return {"tab_id": self._tab_id(page), "url": page.url}
             if action == "tab_select":
                 self._select_page(session, page)
@@ -10766,7 +10767,9 @@ def _browser_mcp_tools(types):
                 "{key}, scroll_down/scroll_up {amount?}, go_back, reload, scrape "
                 "(→ page markdown), screenshot (→ PNG path). evaluate {code} returns "
                 "{value} with the JavaScript script's last expression, including full JSON. "
-                "tabs lists stable tab_id values; tab_new {url?} opens and selects a tab; "
+                "tabs lists stable tab_id values; tab_new {url?} opens and selects a tab, "
+                "returning at navigation commit. Use wait_for or observe to check the "
+                "required page state before further actions. "
                 "tab_select/tab_close {tab_id} select or close it. An optional tab_id on "
                 "other actions targets that tab without changing the default. All tabs "
                 "share this saved context. wait_for {selector, timeout_ms?} waits for a "

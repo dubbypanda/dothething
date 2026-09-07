@@ -4,6 +4,7 @@ Run with DTT_TEST_BROWSER=1 and DTT's virtualenv Python to exercise its installe
 Notte/Camoufox dependencies. No account, model, remote page or saved profile is used.
 """
 
+import asyncio
 import json
 import os
 from pathlib import Path
@@ -34,6 +35,34 @@ class BrowserDomTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         await self.browser.close()
         self.temp.cleanup()
+
+    async def test_new_tab_returns_before_a_script_allows_domcontentloaded(self):
+        session = await self.browser._ensure()
+        context = session.window.page.context
+        script_requested = asyncio.Event()
+        release_script = asyncio.Event()
+        async def document(route):
+            await route.fulfill(content_type="text/html", body=
+                '<!doctype html><script src="/slow.js"></script><div id="ready">Ready</div>')
+        async def slow_script(route):
+            script_requested.set()
+            await release_script.wait()
+            await route.fulfill(content_type="application/javascript", body="window.scriptComplete=true")
+        # Route all fixture requests locally. No server or network is used.
+        await context.route("http://127.0.0.1/fixture.html", document)
+        await context.route("http://127.0.0.1/slow.js", slow_script)
+        try:
+            tab = await asyncio.wait_for(self.browser.act("tab_new", url="http://127.0.0.1/fixture.html"), timeout=5)
+            await asyncio.wait_for(script_requested.wait(), timeout=5)
+            self.assertEqual(tab["url"], "http://127.0.0.1/fixture.html")
+            state = await self.browser.act("evaluate", tab_id=tab["tab_id"], code="document.readyState")
+            self.assertEqual(state, {"value": "loading"})
+            self.assertIn(tab["tab_id"], [item["tab_id"] for item in (await self.browser.act("tabs"))["tabs"]])
+        finally:
+            release_script.set()
+        ready = await self.browser.act("wait_for", tab_id=tab["tab_id"], selector="#ready", timeout_ms=5000)
+        self.assertTrue(ready["found"])
+        self.assertEqual(await self.browser.act("evaluate", tab_id=tab["tab_id"], code="window.scriptComplete"), {"value": True})
 
     async def test_script_completion_large_values_and_tab_isolation(self):
         first = (await self.browser.act("tabs"))["tabs"][0]["tab_id"]

@@ -2021,6 +2021,110 @@ class Browser:
             os.close(self._profile_lock)
             self._profile_lock = None
 
+    def _camoufox_launch_options(self):
+        """Keep fingerprint identity in the profile; rebuild runtime options."""
+        from camoufox.addons import add_default_addons, confirm_paths
+        from camoufox.utils import get_env_vars, get_path, get_target_os, launch_options, launch_path, validate_config
+
+        if self._profile_lock is None or self._profile_dir is None:
+            raise RuntimeError("Acquire the browser profile lock before loading its fingerprint.")
+        if any(key.startswith("CAMOU_CONFIG") for key in os.environ):
+            raise RuntimeError("CAMOU_CONFIG environment overrides conflict with the saved browser fingerprint.")
+
+        path = self._profile_dir / "camoufox-config.json"
+        runtime_prefs = {
+            "media.volume_scale": "0.0",
+            "browser.startup.page": 3,
+            "browser.sessionstore.resume_from_crash": True,
+            # Camoufox defaults to 2, which drops session cookies on quit.
+            "browser.sessionstore.privacy_level": 0,
+        }
+
+        def digest(config, prefs):
+            data = json.dumps({"config": config, "firefox_user_prefs": prefs},
+                              sort_keys=True, separators=(",", ":"), allow_nan=False)
+            return hashlib.sha256(data.encode("utf-8")).hexdigest()
+
+        def validate_identity(config):
+            required = {
+                "navigator.userAgent", "navigator.platform", "navigator.hardwareConcurrency",
+                "screen.width", "screen.height", "fonts", "voices",
+                "fonts:spacing_seed", "audio:seed", "canvas:seed",
+                "webGl:vendor", "webGl:renderer",
+            }
+            properties = json.loads(Path(get_path("properties.json")).read_text(encoding="utf-8"))
+            supported = {item["property"] for item in properties}
+            if not required.issubset(config) or not set(config).issubset(supported):
+                raise ValueError("Incomplete or unsupported fingerprint configuration.")
+            # Camoufox otherwise prints and skips unsupported fields. Check
+            # names first so no values leak and identity never changes silently.
+            validate_config(config)
+
+        if path.exists() or path.is_symlink():
+            try:
+                if path.is_symlink():
+                    raise ValueError("A fingerprint file must not be a symlink.")
+                path.chmod(0o600)
+                saved = json.loads(path.read_text(encoding="utf-8"))
+                if (not isinstance(saved, dict) or type(saved.get("version")) is not int or saved["version"] != 1
+                        or set(saved) != {"version", "config", "firefox_user_prefs", "sha256"}
+                        or not isinstance(saved["config"], dict) or not saved["config"]
+                        or not isinstance(saved["firefox_user_prefs"], dict)
+                        or "addons" in saved["config"]
+                        or saved["sha256"] != digest(saved["config"], saved["firefox_user_prefs"])):
+                    raise ValueError("Incomplete or changed fingerprint configuration.")
+                config = saved["config"]
+                generated_prefs = saved["firefox_user_prefs"]
+                validate_identity(config)
+            except Exception:
+                raise RuntimeError(
+                    f"Saved Camoufox fingerprint is invalid: {path}. "
+                    "Restore the file or inspect it; DTT did not generate a replacement."
+                ) from None
+        else:
+            config = {}
+            generated = launch_options(
+                config=config, headless=self._headless,
+                firefox_user_prefs=dict(runtime_prefs),
+                user_data_dir=str(self._profile_dir),
+            )
+            # Add-on locations and executable/environment paths belong to this
+            # installation. They are not part of the saved fingerprint.
+            config.pop("addons", None)
+            validate_identity(config)
+            generated_prefs = {key: value for key, value in generated["firefox_user_prefs"].items()
+                               if key not in runtime_prefs}
+            saved = {"version": 1, "config": config, "firefox_user_prefs": generated_prefs,
+                     "sha256": digest(config, generated_prefs)}
+            descriptor, temporary = tempfile.mkstemp(prefix=".camoufox-config-", dir=self._profile_dir)
+            try:
+                with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                    json.dump(saved, stream, ensure_ascii=False, sort_keys=True, allow_nan=False)
+                    stream.write("\n")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, path)
+            finally:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
+
+        config = copy.deepcopy(config)
+        addons = []
+        add_default_addons(addons)
+        if addons:
+            confirm_paths(addons)
+            config["addons"] = addons
+        # from_options avoids Camoufox's per-launch fingerprint generator.
+        # The current process environment is used only for this launch.
+        return {
+            "executable_path": launch_path(),
+            "args": [],
+            "env": {**os.environ, **get_env_vars(config, get_target_os(config))},
+            "firefox_user_prefs": {**generated_prefs, **runtime_prefs},
+            "headless": self._headless,
+            "user_data_dir": str(self._profile_dir),
+        }
+
     async def _start_session(self):
         import notte
         from camoufox.async_api import AsyncCamoufox
@@ -2035,18 +2139,23 @@ class Browser:
             viewport_height=DEFAULT_HEADLESS_VIEWPORT_HEIGHT,
         )
         options = BrowserWindowOptions.from_request(SessionStartRequest(**settings))
-        manager = AsyncCamoufox(
-            headless=self._headless,
-            persistent_context=True,
-            user_data_dir=str(self._profile_dir),
-            firefox_user_prefs={
-                "media.volume_scale": "0.0",
-                "browser.startup.page": 3,
-                "browser.sessionstore.resume_from_crash": True,
-                # Camoufox defaults to 2, which drops session cookies on quit.
-                "browser.sessionstore.privacy_level": 0,
-            },
-        )
+        build = asyncio.get_running_loop().run_in_executor(None, self._camoufox_launch_options)
+        try:
+            launch_options = await asyncio.shield(build)
+        except asyncio.CancelledError:
+            # Cancelling an executor await does not stop its writer. Repeated
+            # cancellation must not release the profile lock during a write.
+            while not build.done():
+                try:
+                    await asyncio.shield(build)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:
+                    break
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                build.result()
+            raise
+        manager = AsyncCamoufox(persistent_context=True, from_options=launch_options)
         context = await manager.__aenter__()
         try:
             page = context.pages[-1] if context.pages else await context.new_page()

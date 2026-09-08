@@ -14,6 +14,8 @@ The dtt_browser MCP tool supports evaluate({code, tab_id?}) for JavaScript scrip
 
 tabs lists stable tab_id values with URLs and active state. tab_new({url?}) opens and selects a tab in the same saved browser context. With a URL, it returns the tab ID at navigation commit, while scripts and resources can still be pending. Call wait_for({selector, tab_id, timeout_ms?}) for the element the next action needs. wait_for, click_selector, and upload_files default to 30,000 ms and allow up to 120,000 ms. tab_select({tab_id}) changes the default tab; tab_close({tab_id}) closes it. Other browser actions accept an optional tab_id without changing the default. IDs survive navigation and other tabs' closure, but a browser restart invalidates them. All operations share the saved login state and remain paused during a manual login handoff through dtt_browser_session.
 
+Each browser profile stores its full generated Camoufox fingerprint and generated Firefox preferences in camoufox-config.json, written atomically with mode 0600 under the profile lock. Headless and headed launches reuse that identity. Runtime executable paths, add-on paths and environment values are rebuilt for each launch and are never saved in that file. Invalid or changed saved configuration stops startup without regeneration. Existing profiles receive the file on their next launch and still require the normal login check.
+
 ## Documentation
 
 - [README](https://github.com/fluffypony/dothething/blob/main/README.md): Full usage guide covering installation, CLI flags, architecture, tools, and examples

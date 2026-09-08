@@ -126,6 +126,10 @@ Page fetches and the autonomous browser agent use the same browser session. The 
 
 Named sessions use a Firefox profile in `~/.dtt/browser-sessions/NAME/profile`. Firefox saves cookies, including session cookies, along with localStorage and IndexedDB when you quit the login browser. These files contain login credentials; dtt restricts profile access to your account. DTT migrates earlier browser snapshots and thread cookie files on first use. Changing the display mode of an open browser restarts it and reloads the current URL. Sites can expire logins or require a fresh login.
 
+Each profile also keeps its generated Camoufox fingerprint in `camoufox-config.json`. Restarts and changes between headless and headed mode reuse the complete configuration, including fonts, voices, WebGL properties and noise seeds. DTT creates the file on the profile's next launch, under the profile lock, with private permissions and an atomic write. The file stores configuration and its Firefox preferences; executable paths, add-on paths and the process environment stay outside it.
+
+DTT refreshes runtime paths at launch without generating another identity. An invalid, incomplete or changed fingerprint file stops startup and remains available for inspection. DTT never silently replaces it. Restore the saved file if it becomes damaged. A `CAMOU_CONFIG` environment override also stops startup because it would replace the profile's saved identity. After an existing profile first receives this file, verify its login through the normal browser session flow.
+
 Only one process can use a named session at a time. A second process reports that the session is in use; close the first browser session before retrying. Orchestrator workers inherit the selected name and display mode, so workers that share a name must take turns with the browser.
 
 ### Browser MCP server
@@ -350,6 +354,7 @@ All variables can be saved to `~/.dtt/env` (shell-exported values take precedenc
 | `~/.dtt/threads/` | Saved conversation threads (resume with `--resume`) |
 | `~/.dtt/threads/<id>/cache/` | Per-thread scratch folder (intermediate files, downloads, batch artifacts) |
 | `~/.dtt/browser-sessions/<name>/profile/` | Firefox profile with saved cookies, localStorage, and IndexedDB for a named session |
+| `~/.dtt/browser-sessions/<name>/profile/camoufox-config.json` | Private generated fingerprint and Firefox preferences reused across browser launches |
 | `~/.dtt/skills/<name>/SKILL.md` | User-defined skills (Claude Code convention) |
 | `~/.dtt/mcp.json` | MCP server configuration |
 | `/tmp/dothething/` | Runtime: Python venv, SearXNG, Camoufox browser |

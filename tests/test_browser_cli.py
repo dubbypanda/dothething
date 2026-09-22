@@ -173,6 +173,71 @@ class BrowserMcpDispatchTests(unittest.IsolatedAsyncioTestCase):
         browser.act.assert_awaited_once_with("upload_files", **params)
 
 
+class BrowserMcpSetupTests(unittest.IsolatedAsyncioTestCase):
+    @classmethod
+    def setUpClass(cls):
+        source = (ROOT / "dtt.sh").read_text().split("<< 'PYTHON_AGENT'\n", 1)[1]
+        tree = ast.parse(source.split("\nPYTHON_AGENT", 1)[0])
+        server = next(node for node in tree.body
+                      if isinstance(node, ast.AsyncFunctionDef) and node.name == "run_browser_mcp")
+        helpers = [node for node in server.body
+                   if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                   and node.name in {"setup_agent", "start_setup", "runtime_error"}]
+        # The helpers share setup_task through nonlocal, so they need an
+        # enclosing function like the one they come from.
+        factory = ast.parse("def make_runtime_error(agent):\n    setup_task = None\n").body[0]
+        factory.body += helpers + [ast.Return(ast.Name("runtime_error", ast.Load()))]
+        cls.factory_code = compile(ast.fix_missing_locations(
+            ast.Module(body=[factory], type_ignores=[])), "dtt.sh", "exec")
+        agent = next(node for node in tree.body
+                     if isinstance(node, ast.ClassDef) and node.name == "Agent")
+        setup = next(node for node in agent.body
+                     if isinstance(node, ast.AsyncFunctionDef) and node.name == "setup")
+        cls.setup_code = compile(ast.Module(body=[setup], type_ignores=[]), "dtt.sh", "exec")
+
+    async def test_tool_call_after_failed_start_starts_the_stack_again(self):
+        missing = FileNotFoundError("searxng_venv/bin/python")
+        agent = types.SimpleNamespace(setup=AsyncMock(side_effect=[missing, None]))
+        namespace = {"asyncio": asyncio, "os": os, "Path": Path, "sys": sys}
+        exec(self.factory_code, namespace)
+        runtime_error = namespace["make_runtime_error"](agent)
+
+        with patch.dict(os.environ, {}, clear=True), \
+                contextlib.redirect_stderr(io.StringIO()):
+            error = await runtime_error()
+            self.assertIn("searxng_venv/bin/python", error)
+            self.assertIn("next tool call starts it again", error)
+            self.assertIsNone(await runtime_error())
+            self.assertIsNone(await runtime_error())
+
+        self.assertEqual(agent.setup.await_count, 2)
+
+    async def test_setup_retry_keeps_services_that_already_started(self):
+        client = object()
+        httpx = types.SimpleNamespace(AsyncClient=Mock(return_value=client), Limits=Mock())
+        bridge = types.SimpleNamespace(port=None, session_count=4, url="http://127.0.0.1:4100/serp")
+        bridge.start = Mock(side_effect=lambda: setattr(bridge, "port", 4100))
+        searxng = types.SimpleNamespace(
+            start=Mock(side_effect=[FileNotFoundError("searxng_venv/bin/python"), True]),
+            missing_engines=Mock(return_value=[]), loaded_engines={"google"}, port=4200)
+        agent = types.SimpleNamespace(
+            http=None, cost_tracker=Mock(), serp_bridge=bridge, searxng=searxng,
+            spinner=Mock(), _mcp_mode=True)
+        namespace = {"httpx": httpx, "os": os, "sys": sys}
+        exec(self.setup_code, namespace)
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(FileNotFoundError):
+                await namespace["setup"](agent)
+            await namespace["setup"](agent)
+
+        httpx.AsyncClient.assert_called_once()
+        agent.cost_tracker.start.assert_called_once_with(client)
+        bridge.start.assert_called_once()
+        self.assertEqual(searxng.start.call_count, 2)
+        searxng.start.assert_called_with(agent.spinner, serp_bridge=bridge)
+
+
 class BrowserLoginGateTests(unittest.IsolatedAsyncioTestCase):
     @classmethod
     def setUpClass(cls):

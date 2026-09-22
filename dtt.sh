@@ -6597,35 +6597,39 @@ class Agent:
 
     # ── Setup ────────────────────────────────────────────────────
     async def setup(self):
-        # The shared client serves all model calls, search enrichment, and fetches.
-        # Raise pool limits so parallel batch workloads don't stall behind httpx defaults.
-        self.http = httpx.AsyncClient(
-            timeout=1800,
-            limits=httpx.Limits(
-                max_connections=500,
-                max_keepalive_connections=100,
-            ),
-        )
-        self.cost_tracker.start(self.http)
+        # The MCP server runs setup again after a failed start. What started
+        # the first time keeps running, so the retry does not start a copy.
+        if self.http is None:
+            # The shared client serves all model calls, search enrichment, and fetches.
+            # Raise pool limits so parallel batch workloads don't stall behind httpx defaults.
+            self.http = httpx.AsyncClient(
+                timeout=1800,
+                limits=httpx.Limits(
+                    max_connections=500,
+                    max_keepalive_connections=100,
+                ),
+            )
+            self.cost_tracker.start(self.http)
 
         if getattr(self, '_skip_searxng_start', False):
             print(f"  ✓ SearXNG (shared) on port {self.searxng.port}", file=sys.stderr)
         else:
             # Bridge first: SearXNG reads its URL out of the settings file we
             # write at boot, so the port has to exist before SearXNG starts.
-            self.spinner.start("Starting search browser bridge...")
-            try:
-                self.serp_bridge.start()
-            except Exception as e:
-                self.serp_bridge = None
-                self.spinner.stop()
-                print(f"  ⚠ Notte SERP bridge unavailable ({e}) — "
-                      "general-web engines fall back to direct fetches",
-                      file=sys.stderr)
-            else:
-                self.spinner.stop()
-                print(f"  ✓ Notte SERP bridge on port {self.serp_bridge.port} "
-                      f"({self.serp_bridge.session_count} sessions)", file=sys.stderr)
+            if self.serp_bridge and self.serp_bridge.port is None:
+                self.spinner.start("Starting search browser bridge...")
+                try:
+                    self.serp_bridge.start()
+                except Exception as e:
+                    self.serp_bridge = None
+                    self.spinner.stop()
+                    print(f"  ⚠ Notte SERP bridge unavailable ({e}) — "
+                          "general-web engines fall back to direct fetches",
+                          file=sys.stderr)
+                else:
+                    self.spinner.stop()
+                    print(f"  ✓ Notte SERP bridge on port {self.serp_bridge.port} "
+                          f"({self.serp_bridge.session_count} sessions)", file=sys.stderr)
 
             self.spinner.start("Starting SearXNG...")
             ok = self.searxng.start(self.spinner, serp_bridge=self.serp_bridge)
@@ -11050,7 +11054,10 @@ async def run_browser_mcp(browser_session="default", headed=False):
 
     def start_setup():
         nonlocal setup_task
-        if setup_task is None:
+        # A failed start is not final. Its cause, such as a broken venv, can be
+        # fixed while this server runs, so the next call starts it again.
+        if setup_task is None or (setup_task.done() and (
+                setup_task.cancelled() or setup_task.exception() is not None)):
             setup_task = asyncio.create_task(setup_agent())
         return setup_task
 
@@ -11082,7 +11089,8 @@ async def run_browser_mcp(browser_session="default", headed=False):
         except asyncio.TimeoutError:
             return "The DTT search and browser stack is still starting. Retry this tool shortly."
         except Exception as e:
-            return f"The DTT search and browser stack failed to start: {e}"
+            return (f"The DTT search and browser stack failed to start: {e}. "
+                    "The next tool call starts it again.")
         return None
 
     @server.list_tools()

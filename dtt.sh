@@ -408,12 +408,56 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# ── Python environments ──────────────────────────────────────────
+# Build every venv from the python3 on PATH now, before dtt activates its own.
+# Run from inside a venv, python3 -m venv links the new venv to the real path
+# of the base interpreter. On Homebrew that is a versioned Cellar folder, and
+# the next patch upgrade deletes it.
+BASE_PYTHON="$(command -v python3)"
+
+# A venv works when its interpreter starts and sees the venv's own
+# site-packages. The interpreter stops starting once the Python it links to is
+# deleted. It stops seeing site-packages once the link reaches another minor
+# version, as when a distro upgrade points /usr/bin/python3 at a new release.
+venv_works() {
+    [ -f "$1/bin/activate" ] && "$1/bin/python" -I -c \
+        'import os, sys, sysconfig; sys.exit(not os.path.isdir(sysconfig.get_path("purelib")))' \
+        2>/dev/null
+}
+
+# ensure_venv DIR MARKER...
+# Make DIR a working venv. This runs on every start, because nothing else
+# notices a broken venv. A broken venv built for BASE_PYTHON's minor version
+# is relinked in place and keeps its packages. Any other is rebuilt. A new
+# venv is empty, so its MARKER files go too and the install steps run again.
+ensure_venv() {
+    local venv="$1" built base
+    shift
+    if [ -d "$venv" ]; then
+        venv_works "$venv" && return 0
+        built=$(sed -n 's/^version *= *\([0-9]*\.[0-9]*\).*/\1/p' "$venv/pyvenv.cfg" 2>/dev/null || true)
+        base=$("$BASE_PYTHON" -c 'import sys; print("%d.%d" % sys.version_info[:2])')
+        # Relink only a venv whose packages are still there. venv --upgrade
+        # creates an empty site-packages, which would pass venv_works.
+        if [ "$built" = "$base" ] && [ -d "$venv/lib/python$built/site-packages" ]; then
+            echo "▸ Relinking $venv to $BASE_PYTHON..."
+            # venv --upgrade keeps an interpreter link that already exists,
+            # even a broken one, so remove the old links first.
+            rm -f "$venv/bin/python" "$venv/bin/python3" "$venv/bin/python$built"
+            "$BASE_PYTHON" -m venv --upgrade --without-pip "$venv" >/dev/null 2>&1 || true
+            venv_works "$venv" && return 0
+        fi
+        echo "▸ Rebuilding $venv for Python $base..."
+        rm -rf "$venv"
+    else
+        echo "▸ Creating Python environment $venv..."
+    fi
+    rm -f "$@"
+    "$BASE_PYTHON" -m venv "$venv"
+}
+
 # ── Main Python environment ──────────────────────────────────────
-if [ -d "$VENV" ] && [ ! -f "$VENV/bin/activate" ]; then rm -rf "$VENV"; fi
-if [ ! -d "$VENV" ]; then
-    echo "▸ Creating Python environment..."
-    python3 -m venv "$VENV"
-fi
+ensure_venv "$VENV" "$DTT_CACHE/.deps_v7" "$DTT_CACHE/.notte_pin"
 source "$VENV/bin/activate"
 
 if [ ! -f "$DTT_CACHE/.deps_v7" ]; then
@@ -427,6 +471,7 @@ if [ ! -f "$DTT_CACHE/.deps_v7" ]; then
 fi
 
 # ── SearXNG in its own venv ──────────────────────────────────────
+ensure_venv "$DTT_CACHE/searxng_venv" "$DTT_CACHE/.searxng_v5"
 if [ ! -f "$DTT_CACHE/.searxng_v5" ]; then
     echo "▸ Installing SearXNG (first run — takes 1-2 min)..."
     # v5 bump: force a fresh clone. v4 and earlier installed once and then
@@ -434,7 +479,6 @@ if [ ! -f "$DTT_CACHE/.searxng_v5" ]; then
     # notte_serp engine leans on upstream's parsers staying current.
     rm -rf "$DTT_CACHE/searxng"
     git clone --depth 1 -q https://github.com/searxng/searxng.git "$DTT_CACHE/searxng"
-    [ ! -f "$DTT_CACHE/searxng_venv/bin/activate" ] && python3 -m venv "$DTT_CACHE/searxng_venv"
     "$DTT_CACHE/searxng_venv/bin/pip" install -q -U pip setuptools wheel pyyaml msgspec typing_extensions 2>/dev/null
     "$DTT_CACHE/searxng_venv/bin/pip" install -q pdm 2>/dev/null || true
     "$DTT_CACHE/searxng_venv/bin/pip" install -q --use-pep517 --no-build-isolation -e "$DTT_CACHE/searxng" 2>/dev/null

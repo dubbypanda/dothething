@@ -982,6 +982,9 @@ MAX_INLINE_BYTES = 5 * 1024 * 1024
 CHALLENGE_MAX_BODY_TEXT = 2000
 DEFAULT_HEADLESS_VIEWPORT_WIDTH = 1280
 DEFAULT_HEADLESS_VIEWPORT_HEIGHT = 1080
+# A kept browser tab stops reopening once no agent has used it or asked to
+# keep it for this long.
+KEPT_TAB_MAX_IDLE_SECONDS = 7 * 24 * 60 * 60
 # How many browser sessions the SERP bridge runs. SearXNG queries every engine
 # for a search at once, so this is what stops the Notte lane from queueing:
 # roughly ceil(len(SEARXNG_NOTTE_ENGINES) / sessions) rounds of ~5s each. Each
@@ -2021,6 +2024,9 @@ class Browser:
         self._tabs = {}
         self._next_tab_id = 1
         self._tab_snapshots = {}
+        # Tabs to reopen in the next session: {"page", "url", "used_at"}.
+        # "page" is None while a record waits for a session that opens it.
+        self._kept_tabs = []
         self.session_name = None
         self._profile_dir = Path(profile_dir) if profile_dir else None
         if session_name is not None:
@@ -2095,8 +2101,8 @@ class Browser:
 
         Firefox restores saved windows as tabs that never load and that
         Playwright never reports, and each launch adds its start page to them.
-        Firefox reads the first valid file of several after a crash, so clear
-        every copy.
+        Kept tabs reopen through Playwright instead. Firefox reads the first
+        valid file of several after a crash, so clear every copy.
         """
         import lz4.block
         magic = b"mozLz40\0"
@@ -2272,12 +2278,19 @@ class Browser:
             await manager.__aexit__(None, None, None)
             raise
 
-    async def _ensure(self):
+    async def _ensure(self, reopen_kept=True):
+        """Return the open session, starting one when needed.
+
+        A new session reopens kept tabs, except when reopen_kept is false.
+        The login handoff shows only its login page; kept tabs then reopen
+        with the headless session that follows it.
+        """
         async with self._lock:
             if self._session is not None and self._session.window.page.is_closed():
                 pages = [page for page in self._session.window.page.context.pages if not page.is_closed()]
                 if pages:
-                    self._select_page(self._session, pages[-1])
+                    spare = [page for page in pages if self._kept_record(page) is None]
+                    self._select_page(self._session, spare[-1] if spare else await pages[0].context.new_page())
                 else:
                     await self._close_session(release_lock=False)
             if self._session is None:
@@ -2298,7 +2311,85 @@ class Browser:
                             await session.__aexit__(None, None, None)
                     self._release_profile_lock()
                     raise
+                await self._open_kept_tabs(reopen_kept)
             return self._session
+
+    def _read_kept_tabs(self):
+        """Return saved kept tabs that an agent used or kept inside the idle limit."""
+        path = self._profile_dir / "kept-tabs.json" if self._profile_dir else None
+        try:
+            saved = json.loads(path.read_text(encoding="utf-8")) if path else {}
+        except FileNotFoundError:
+            return []
+        except (OSError, ValueError) as error:
+            print(f"Ignoring unreadable kept-tab list {path}: {error}", file=sys.stderr)
+            return []
+        tabs = saved.get("tabs") if isinstance(saved, dict) and saved.get("version") == 1 else None
+        cutoff = time.time() - KEPT_TAB_MAX_IDLE_SECONDS
+        return [{"url": tab["url"], "used_at": float(tab["used_at"])}
+                for tab in (tabs if isinstance(tabs, list) else [])
+                if isinstance(tab, dict) and isinstance(tab.get("url"), str) and tab["url"]
+                and type(tab.get("used_at")) in (int, float) and tab["used_at"] >= cutoff]
+
+    async def _open_kept_tabs(self, reopen):
+        """Load the kept tabs of a new session, and open them unless told not to.
+
+        A record whose tab could not open waits for the next session. A tab
+        whose page fails to load stays open and keeps its saved address.
+        """
+        self._kept_tabs = [{"page": None, **record} for record in self._read_kept_tabs()]
+        if not reopen:
+            return
+        context = self._session.window.page.context
+        loads = []
+        for record in self._kept_tabs:
+            try:
+                record["page"] = await context.new_page()
+            except Exception:
+                continue
+            if record["url"] != "about:blank":
+                loads.append(record["page"].goto(record["url"], wait_until="commit", timeout=15000))
+        await asyncio.gather(*loads, return_exceptions=True)
+
+    def _save_kept_tabs(self):
+        """Save the tabs to reopen in the next session and return their addresses."""
+        if self._profile_dir is None:
+            return []
+        rows = []
+        for record in self._kept_tabs:
+            page = record["page"]
+            # A closed page still reports its last address.
+            if page is not None and page.url not in ("", "about:blank"):
+                record["url"] = page.url
+            rows.append({"url": record["url"], "used_at": record["used_at"]})
+        path = self._profile_dir / "kept-tabs.json"
+        if rows or path.exists():
+            text = json.dumps({"version": 1, "tabs": rows}, indent=1)
+            self._replace_file(path, (text + "\n").encode("utf-8"))
+        return [row["url"] for row in rows]
+
+    def _kept_record(self, page):
+        return next((record for record in self._kept_tabs
+                     if page is not None and record["page"] is page), None)
+
+    def _keep(self, tab_ids):
+        """Make exactly these open tabs reopen in the next session."""
+        now = time.time()
+        pages = [self._tabs[tab_id] for tab_id in dict.fromkeys(tab_ids)]
+        self._kept_tabs = [{"page": page, "url": page.url, "used_at": now} for page in pages]
+        return self._save_kept_tabs()
+
+    def _touch(self, page):
+        """Restart the idle limit of a kept tab that an agent used."""
+        record = self._kept_record(page)
+        if record is None:
+            return
+        record["used_at"] = time.time()
+        try:
+            self._save_kept_tabs()
+        except OSError as error:
+            # The close of this session saves the time again.
+            print(f"Could not save kept browser tabs: {error}", file=sys.stderr)
 
     def _check_automation(self):
         if self._paused:
@@ -2320,6 +2411,7 @@ class Browser:
             "url": page.url if page else self._last_url,
             "login_state": self._login_state,
             "login_error": self._login_error,
+            "tabs": self._tab_list(self._session) if live_pages else [],
         }
 
     async def _close_session(self, release_lock=True):
@@ -2327,7 +2419,10 @@ class Browser:
         try:
             if session is not None:
                 self._last_url = session.window.page.url
-                await session.__aexit__(None, None, None)
+                try:
+                    self._save_kept_tabs()
+                finally:
+                    await session.__aexit__(None, None, None)
                 # Native shutdown flushes the imported state before its old files go.
                 for legacy in (self._legacy_state_file, self._legacy_cookie_file):
                     if legacy:
@@ -2337,6 +2432,7 @@ class Browser:
             self._session = None
             self._tabs.clear()
             self._tab_snapshots.clear()
+            self._kept_tabs = []
             if release_lock:
                 self._release_profile_lock()
 
@@ -2389,7 +2485,7 @@ class Browser:
                     self._headless = True
                     active = await self._ensure()
                     if target and target != "about:blank":
-                        result = await active.aexecute(type="goto", url=target)
+                        result = await self._goto(active, target)
                         if not result.success:
                             raise RuntimeError(f"Could not reopen {target}: {result.message}")
                     self._paused = False
@@ -2406,11 +2502,18 @@ class Browser:
 
         self._login_task = asyncio.create_task(monitor(), name="dtt-browser-login")
 
-    async def control(self, action, session=None, headed=None, url=None, timeout_seconds=30):
-        if action not in ("status", "open", "resume", "close", "login", "wait"):
-            raise ValueError("Unknown browser session action. Use login, wait, status, open, resume or close.")
+    async def control(self, action, session=None, headed=None, url=None, timeout_seconds=30, keep_tabs=None):
+        if action not in ("status", "open", "resume", "close", "login", "wait", "keep"):
+            raise ValueError("Unknown browser session action. Use login, wait, status, open, resume, keep or close.")
         if action not in ("open", "login") and (session is not None or url is not None):
             raise ValueError("session and url are only valid with action='open' or 'login'.")
+        if keep_tabs is not None:
+            if action not in ("keep", "close"):
+                raise ValueError("keep_tabs is only valid with action='keep' or 'close'.")
+            if not isinstance(keep_tabs, list) or not all(isinstance(tab_id, str) and tab_id.strip() for tab_id in keep_tabs):
+                raise ValueError("keep_tabs must be a list of tab IDs.")
+        elif action == "keep":
+            raise ValueError("keep_tabs is required for action='keep'.")
         if headed is not None:
             if not isinstance(headed, bool):
                 raise ValueError("headed must be a boolean.")
@@ -2432,11 +2535,27 @@ class Browser:
         if action == "status":
             return self._status()
         async with self._operation_lock:
+            if keep_tabs is not None:
+                tabs = self._sync_tabs(self._session) if self._session is not None else {}
+                unknown = next((tab_id for tab_id in keep_tabs if tab_id not in tabs), None)
+                if unknown is not None:
+                    raise ValueError(f"Unknown or closed browser tab: {unknown}")
+                if self._session is not None:
+                    self._keep(keep_tabs)
+                elif self._profile_dir is not None and (self._profile_dir / "kept-tabs.json").exists():
+                    # A closed browser has no tabs, so this list is empty. Clear
+                    # the saved list, unless another process uses the profile.
+                    self._acquire_profile_lock()
+                    try:
+                        self._keep([])
+                    finally:
+                        self._release_profile_lock()
             if action == "close":
                 await self._cancel_login()
                 await self._close_session()
                 self._paused = False
-                return self._status()
+            if action in ("keep", "close"):
+                return {**self._status(), "kept_tabs": [tab["url"] for tab in self._read_kept_tabs()]}
             if self._login_task is not None and not self._login_task.done():
                 if action == "login" and (session is None or session == self.session_name) and (url is None or url == self._login_url):
                     return self._status()
@@ -2461,10 +2580,10 @@ class Browser:
             if changing_session:
                 self._select_session(session)
             self._headless = headless
-            active = await self._ensure()
+            active = await self._ensure(reopen_kept=action != "login")
             target = url or previous_url
             if target and target != "about:blank":
-                result = await active.aexecute(type="goto", url=target)
+                result = await self._goto(active, target)
                 if not result.success:
                     raise RuntimeError(f"Error navigating to {target}: {result.message}")
             if not self._headless:
@@ -2637,7 +2756,7 @@ class Browser:
           except Exception as e:
             return f"Error launching browser: {e}"
           try:
-            result = await session.aexecute(type="goto", url=url)
+            result = await self._goto(session, url)
             if not result.success:
                 return f"Error navigating to {url}: {result.message}"
 
@@ -2879,6 +2998,12 @@ class Browser:
     def _tab_id(self, page):
         return next(key for key, candidate in self._tabs.items() if candidate is page)
 
+    def _tab_list(self, session):
+        active = session.window.page
+        return [{"tab_id": key, "url": tab.url, "active": tab is active,
+                 "keep": self._kept_record(tab) is not None}
+                for key, tab in self._sync_tabs(session).items()]
+
     def _select_page(self, session, page):
         previous = session.window.page
         if previous is page:
@@ -2889,6 +3014,15 @@ class Browser:
             self._tab_snapshots[previous] = session._snapshot
             session.snapshot = self._tab_snapshots.get(page)
         session.window.page = page
+
+    async def _goto(self, session, url):
+        """Navigate for a caller without tab IDs. It never moves a kept tab away."""
+        page = session.window.page
+        if self._kept_record(page) is not None:
+            spare = [tab for tab in page.context.pages
+                     if not tab.is_closed() and self._kept_record(tab) is None]
+            self._select_page(session, spare[-1] if spare else await page.context.new_page())
+        return await session.aexecute(type="goto", url=url)
 
     @staticmethod
     def _validate_action(action, params):
@@ -2949,6 +3083,7 @@ class Browser:
         callers wait for the required page state separately. IDs survive navigation and are never
         reused; a browser restart invalidates them. Evaluate uses JavaScript
         script completion semantics, including the last expression's value.
+        Any action on a kept tab, except closing it, restarts its idle limit.
         """
         async with self._operation_lock:
             self._check_automation()
@@ -2961,8 +3096,7 @@ class Browser:
                 raise ValueError(f"Unknown or closed browser tab: {tab_id}")
             page = self._tabs[tab_id] if tab_id else previous
             if action == "tabs":
-                return {"tabs": [{"tab_id": key, "url": tab.url, "active": tab is previous}
-                                 for key, tab in self._tabs.items()]}
+                return {"tabs": self._tab_list(session)}
             if action == "tab_new":
                 page = await previous.context.new_page()
                 self._sync_tabs(session)
@@ -2970,74 +3104,82 @@ class Browser:
                 if params.get("url"):
                     await page.goto(params["url"], wait_until="commit")
                 return {"tab_id": self._tab_id(page), "url": page.url}
-            if action == "tab_select":
-                self._select_page(session, page)
-                return {"tab_id": tab_id, "url": page.url}
             if action == "tab_close":
-                # Keep the context alive when its final tab is closed.
-                if len(self._tabs) == 1:
-                    replacement = await page.context.new_page()
-                else:
-                    replacement = next(tab for tab in self._tabs.values() if tab is not page)
+                record = self._kept_record(page)
+                if record is not None:
+                    # The agent closed it, so it does not reopen.
+                    self._kept_tabs.remove(record)
+                    self._save_kept_tabs()
                 if page is previous:
-                    self._select_page(session, replacement)
+                    # Keep the context alive when its final tab is closed, and
+                    # give default operations a tab that is not kept.
+                    spare = [tab for tab in self._tabs.values()
+                             if tab is not page and self._kept_record(tab) is None]
+                    self._select_page(session, spare[0] if spare else await page.context.new_page())
                 await page.close()
                 self._sync_tabs(session)
                 return {"tab_id": tab_id, "closed": True}
-            if action == "evaluate":
-                value = await page.evaluate("code => (0, eval)(code)", params["code"])
-                # Reject values that JSON cannot represent instead of returning
-                # invalid JSON or silently stringifying page objects.
-                json.dumps(value, allow_nan=False)
-                return {"value": value}
-            if action == "wait_for":
-                await page.wait_for_selector(params["selector"], timeout=params.get("timeout_ms", 30000))
-                return {"tab_id": self._tab_id(page), "url": page.url, "found": True}
-            if action == "click_selector":
-                await page.locator(params["selector"]).click(timeout=params.get("timeout_ms", 30000))
-                return {"tab_id": self._tab_id(page), "url": page.url, "clicked": True}
-            if action == "upload_files":
-                await page.locator(params["selector"]).set_input_files(
-                    params["paths"], timeout=params.get("timeout_ms", 30000))
-                return {"tab_id": self._tab_id(page), "url": page.url, "uploaded": params["paths"]}
-            if action == "screenshot":
-                out_dir = params.get("dir") or str(BASE / "screenshots")
-                Path(out_dir).mkdir(parents=True, exist_ok=True)
-                path = str(Path(out_dir) / f"browser_{int(time.time()*1000)}.png")
-                data = await page.screenshot(full_page=params.get("full_page", False))
-                Path(path).write_bytes(data)
-                return {"screenshot": path}
-
-            self._select_page(session, page)
             try:
-                if action == "observe":
-                    obs = await session.aobserve()
-                    els = []
-                    space = getattr(obs, "space", None)
-                    for a in (getattr(space, "interaction_actions", None) or []):
-                        els.append({
-                            "id": getattr(a, "id", None),
-                            "description": getattr(a, "description", "") or "",
-                            "type": type(a).__name__,
-                        })
-                    return {"url": page.url, "title": await page.title(),
-                            "elements": els[:200], "element_count": len(els),
-                            "truncated": len(els) > 200}
-                if action == "scrape":
-                    md = await session.ascrape(only_main_content=params.get("only_main_content", True))
-                    md = md or ""
-                    return {"url": page.url, "markdown": md[:50000],
-                            "character_count": len(md), "truncated": len(md) > 50000}
-                result = await session.aexecute(type=action, **params)
-                return {
-                    "success": bool(getattr(result, "success", True)),
-                    "message": getattr(result, "message", "") or "",
-                    "url": session.window.page.url,
-                }
+                if action == "tab_select":
+                    self._select_page(session, page)
+                    return {"tab_id": tab_id, "url": page.url}
+                if action == "evaluate":
+                    value = await page.evaluate("code => (0, eval)(code)", params["code"])
+                    # Reject values that JSON cannot represent instead of returning
+                    # invalid JSON or silently stringifying page objects.
+                    json.dumps(value, allow_nan=False)
+                    return {"value": value}
+                if action == "wait_for":
+                    await page.wait_for_selector(params["selector"], timeout=params.get("timeout_ms", 30000))
+                    return {"tab_id": self._tab_id(page), "url": page.url, "found": True}
+                if action == "click_selector":
+                    await page.locator(params["selector"]).click(timeout=params.get("timeout_ms", 30000))
+                    return {"tab_id": self._tab_id(page), "url": page.url, "clicked": True}
+                if action == "upload_files":
+                    await page.locator(params["selector"]).set_input_files(
+                        params["paths"], timeout=params.get("timeout_ms", 30000))
+                    return {"tab_id": self._tab_id(page), "url": page.url, "uploaded": params["paths"]}
+                if action == "screenshot":
+                    out_dir = params.get("dir") or str(BASE / "screenshots")
+                    Path(out_dir).mkdir(parents=True, exist_ok=True)
+                    path = str(Path(out_dir) / f"browser_{int(time.time()*1000)}.png")
+                    data = await page.screenshot(full_page=params.get("full_page", False))
+                    Path(path).write_bytes(data)
+                    return {"screenshot": path}
+
+                self._select_page(session, page)
+                try:
+                    if action == "observe":
+                        obs = await session.aobserve()
+                        els = []
+                        space = getattr(obs, "space", None)
+                        for a in (getattr(space, "interaction_actions", None) or []):
+                            els.append({
+                                "id": getattr(a, "id", None),
+                                "description": getattr(a, "description", "") or "",
+                                "type": type(a).__name__,
+                            })
+                        return {"url": page.url, "title": await page.title(),
+                                "elements": els[:200], "element_count": len(els),
+                                "truncated": len(els) > 200}
+                    if action == "scrape":
+                        md = await session.ascrape(only_main_content=params.get("only_main_content", True))
+                        md = md or ""
+                        return {"url": page.url, "markdown": md[:50000],
+                                "character_count": len(md), "truncated": len(md) > 50000}
+                    result = await session.aexecute(type=action, **params)
+                    return {
+                        "success": bool(getattr(result, "success", True)),
+                        "message": getattr(result, "message", "") or "",
+                        "url": session.window.page.url,
+                    }
+                finally:
+                    if tab_id is not None and not previous.is_closed():
+                        self._select_page(session, previous)
+                    self._sync_tabs(session)
             finally:
-                if tab_id is not None and not previous.is_closed():
-                    self._select_page(session, previous)
-                self._sync_tabs(session)
+                # Reading or controlling a kept tab restarts its idle limit.
+                self._touch(page)
 
     async def agent(self, task, url=None, max_steps=20):
         async with self._operation_lock:
@@ -3045,9 +3187,11 @@ class Browser:
             session = await self._ensure()
             import notte
             if url:
-                nav = await session.aexecute(type="goto", url=url)
+                nav = await self._goto(session, url)
                 if not nav.success:
                     return f"Error navigating to {url}: {nav.message}"
+            # Without a URL the agent works in the active tab, which can be a kept tab.
+            self._touch(session.window.page)
             agent = notte.Agent(
                 session=session,
                 reasoning_model=f"openrouter/{BROWSER_AGENT_MODEL}",
@@ -5357,16 +5501,23 @@ TOOLS = [
                 "repeat wait if still waiting instead of repeatedly polling status. Closure does not "
                 "prove login succeeded: inspect the resumed page. Named Firefox profiles preserve "
                 "cookies, localStorage and IndexedDB across runs. Status reports the session. "
-                "For intentional manual control, open pauses until resume; close closes the browser."
+                "For intentional manual control, open pauses until resume; close closes the browser. "
+                "Tabs close with the browser unless kept. Status lists open tabs with tab_id and keep. "
+                "To reopen tabs in the next run, pass their tab_id values as keep_tabs to "
+                "action='keep', or to action='close' when you finish. keep_tabs replaces the kept "
+                "set, so list every tab to keep; [] keeps none. A kept tab stops reopening after "
+                "7 days in which no agent used it or kept it again. fetch_page and browser_agent "
+                "with a url never navigate a kept tab away."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["login", "wait", "status", "open", "resume", "close"]},
+                    "action": {"type": "string", "enum": ["login", "wait", "status", "open", "resume", "keep", "close"]},
                     "session": {"type": "string", "description": "Optional session name for login or open. Omit to keep the current session."},
                     "headed": {"type": "boolean", "description": "For manual open/resume only. Open defaults to true; resume keeps the current mode unless set. Login always opens headed and continues headless."},
                     "url": {"type": "string", "description": "Optional URL for login or open."},
                     "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 30, "default": 30, "description": "Maximum seconds for action=wait. A timeout leaves the handoff active."},
+                    "keep_tabs": {"type": "array", "items": {"type": "string"}, "description": "For keep or close: every tab_id to reopen in the next run. Other tabs close with the browser."},
                     "result_mode": RESULT_MODE_PROP,
                 },
                 "required": ["action", "result_mode"],
@@ -8235,9 +8386,10 @@ class Agent:
             f"Successful: {len(items) - errors[0]}, Errors: {errors[0]}"
         )
 
-    async def _tool_browser_session(self, action, session=None, headed=None, url=None, timeout_seconds=30, **kw):
+    async def _tool_browser_session(self, action, session=None, headed=None, url=None, timeout_seconds=30, keep_tabs=None, **kw):
         try:
-            result = await self.browser.control(action, session=session, headed=headed, url=url, timeout_seconds=timeout_seconds)
+            result = await self.browser.control(action, session=session, headed=headed, url=url,
+                                                timeout_seconds=timeout_seconds, keep_tabs=keep_tabs)
             if action == "login" and not getattr(self, "_mcp_mode", False):
                 self.spinner.stop()
                 print("\nComplete the login in the browser, then close its windows or quit it. DTT will continue automatically.", file=sys.stderr)
@@ -10980,7 +11132,8 @@ def _browser_mcp_tools(types):
                 "{key}, scroll_down/scroll_up {amount?}, go_back, reload, scrape "
                 "(→ page markdown), screenshot (→ PNG path). evaluate {code} returns "
                 "{value} with the JavaScript script's last expression, including full JSON. "
-                "tabs lists stable tab_id values; tab_new {url?} opens and selects a tab, "
+                "tabs lists stable tab_id values, marking tabs kept for the next session "
+                "with keep: true; tab_new {url?} opens and selects a tab, "
                 "returning at navigation commit. Use wait_for or observe to check the "
                 "required page state before further actions. "
                 "tab_select/tab_close {tab_id} select or close it. An optional tab_id on "
@@ -11036,16 +11189,24 @@ def _browser_mcp_tools(types):
                 "succeeded: inspect the resumed page. Status reports session and "
                 "handoff state. Profiles persist cookies, localStorage and IndexedDB. "
                 "For intentional manual control, open pauses until resume; close "
-                "closes the browser."
+                "closes the browser. Tabs close with the browser unless kept: to "
+                "reopen tabs in the next session, pass their tab_id values as "
+                "keep_tabs to action='keep', or to action='close' when you finish. "
+                "keep_tabs replaces the kept set, so list every tab to keep; [] keeps "
+                "none. Status and dtt_browser tabs show keep: true on kept tabs. A "
+                "kept tab stops reopening after 7 days in which no agent used it or "
+                "kept it again. dtt_fetch and dtt_browser_agent with a url never "
+                "navigate a kept tab away."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["login", "wait", "status", "open", "resume", "close"]},
+                    "action": {"type": "string", "enum": ["login", "wait", "status", "open", "resume", "keep", "close"]},
                     "session": {"type": "string", "description": "optional saved session name for login or open"},
                     "headed": {"type": "boolean", "description": "for manual open/resume only; open defaults to true, resume keeps the current mode unless set; login always opens headed and continues headless"},
                     "url": {"type": "string", "description": "optional URL for login or open"},
                     "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 30, "default": 30, "description": "maximum seconds for action=wait; a timeout leaves the handoff active"},
+                    "keep_tabs": {"type": "array", "items": {"type": "string", "minLength": 1}, "description": "for keep or close: every tab_id to reopen in the next session; other tabs close with the browser"},
                 },
                 "required": ["action"],
                 "additionalProperties": False,
@@ -11160,7 +11321,8 @@ async def run_browser_mcp(browser_session="default", headed=False):
             return await agent._tool_browser_session(
                 a.get("action"), session=a.get("session"),
                 headed=a.get("headed"), url=a.get("url"),
-                timeout_seconds=a.get("timeout_seconds", 30))
+                timeout_seconds=a.get("timeout_seconds", 30),
+                keep_tabs=a.get("keep_tabs"))
         if name == "dtt_browser_agent":
             if not api_key:
                 raise RuntimeError(

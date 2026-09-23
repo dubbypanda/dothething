@@ -2,7 +2,9 @@
 
 import ast
 import asyncio
+import contextlib
 import copy
+import io
 import json
 import os
 from pathlib import Path
@@ -707,8 +709,8 @@ class BrowserSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(session.window.page, active)
         tabs = (await browser.act("tabs"))["tabs"]
         self.assertEqual(tabs, [
-            {"tab_id": first, "url": "https://example.test/first", "active": False},
-            {"tab_id": second["tab_id"], "url": "https://example.test/second", "active": True},
+            {"tab_id": first, "url": "https://example.test/first", "active": False, "keep": False},
+            {"tab_id": second["tab_id"], "url": "https://example.test/second", "active": True, "keep": False},
         ])
         await browser.act("tab_select", tab_id=first)
         self.assertIs(session.window.page, session.context.pages[0])
@@ -728,7 +730,7 @@ class BrowserSessionTests(unittest.IsolatedAsyncioTestCase):
         session = FakeSession.instances[0]
         await session.window.page.close()
         tabs = (await browser.act("tabs"))["tabs"]
-        self.assertEqual(tabs, [{"tab_id": first, "url": "about:blank", "active": True}])
+        self.assertEqual(tabs, [{"tab_id": first, "url": "about:blank", "active": True, "keep": False}])
         self.assertEqual(len(FakeSession.instances), 1)
         with self.assertRaisesRegex(ValueError, "Unknown or closed"):
             await browser.act("tab_select", tab_id=second["tab_id"])
@@ -892,6 +894,199 @@ class BrowserSessionTests(unittest.IsolatedAsyncioTestCase):
             release.set()
             await asyncio.wait_for(asyncio.gather(active, second), timeout=1)
 
+    def kept_file(self):
+        return json.loads((self.profile / "kept-tabs.json").read_text())["tabs"]
+
+    async def test_only_kept_tabs_reopen_in_the_next_session(self):
+        browser = self.browser(profile_dir=self.profile)
+        kept = await browser.act("tab_new", url="https://example.test/inbox")
+        await browser.act("tab_new", url="https://example.test/article")
+        result = await browser.control("close", keep_tabs=[kept["tab_id"]])
+        self.assertFalse(result["open"])
+        self.assertEqual(result["kept_tabs"], ["https://example.test/inbox"])
+        reopened = self.browser(profile_dir=self.profile)
+        tabs = (await reopened.act("tabs"))["tabs"]
+        self.assertEqual([(tab["url"], tab["active"], tab["keep"]) for tab in tabs], [
+            ("about:blank", True, False),
+            ("https://example.test/inbox", False, True),
+        ])
+        status = await reopened.control("status")
+        self.assertEqual(status["tabs"], tabs)
+
+    async def test_keep_replaces_the_kept_set_without_closing(self):
+        browser = self.browser(profile_dir=self.profile)
+        one = await browser.act("tab_new", url="https://example.test/one")
+        two = await browser.act("tab_new", url="https://example.test/two")
+        result = await browser.control("keep", keep_tabs=[one["tab_id"], two["tab_id"], one["tab_id"]])
+        self.assertTrue(result["open"])
+        self.assertEqual(result["kept_tabs"], ["https://example.test/one", "https://example.test/two"])
+        self.assertEqual([tab["keep"] for tab in result["tabs"]], [False, True, True])
+        result = await browser.control("keep", keep_tabs=[two["tab_id"]])
+        self.assertEqual(result["kept_tabs"], ["https://example.test/two"])
+        result = await browser.control("keep", keep_tabs=[])
+        self.assertEqual(result["kept_tabs"], [])
+        await browser.close()
+        await self.browser(profile_dir=self.profile)._ensure()
+        self.assertEqual(len(FakeSession.instances[-1].context.pages), 1)
+
+    async def test_invalid_keep_tabs_leave_the_browser_and_kept_set_unchanged(self):
+        browser = self.browser(profile_dir=self.profile)
+        await browser.act("tab_new", url="https://example.test/one")
+        for action, keep_tabs, message in (
+            ("close", ["tab-99"], "Unknown or closed browser tab: tab-99"),
+            ("keep", None, "required"),
+            ("keep", "tab-1", "list of tab IDs"),
+            ("keep", [""], "list of tab IDs"),
+            ("status", [], "only valid"),
+            ("open", ["tab-1"], "only valid"),
+        ):
+            with self.subTest(action=action, keep_tabs=keep_tabs):
+                with self.assertRaisesRegex(ValueError, message):
+                    await browser.control(action, keep_tabs=keep_tabs)
+        self.assertTrue((await browser.control("status"))["open"])
+        self.assertFalse((self.profile / "kept-tabs.json").exists())
+
+    async def test_empty_keep_list_clears_saved_tabs_of_a_closed_browser(self):
+        browser = self.browser(profile_dir=self.profile)
+        kept = await browser.act("tab_new", url="https://example.test/inbox")
+        await browser.control("close", keep_tabs=[kept["tab_id"]])
+        with self.assertRaisesRegex(ValueError, "Unknown or closed"):
+            await browser.control("keep", keep_tabs=[kept["tab_id"]])
+        # Another process that uses the profile keeps its saved tabs.
+        other = self.browser(profile_dir=self.profile)
+        await other._ensure()
+        with self.assertRaisesRegex(RuntimeError, "in use by another process"):
+            await browser.control("close", keep_tabs=[])
+        self.assertEqual([tab["keep"] for tab in (await other.act("tabs"))["tabs"]], [False, True])
+        await other.close()
+        result = await browser.control("close", keep_tabs=[])
+        self.assertEqual(result["kept_tabs"], [])
+        self.assertIsNone(browser._profile_lock)
+        await browser._ensure()
+        self.assertEqual(len(FakeSession.instances[-1].context.pages), 1)
+
+    async def test_kept_tab_closes_after_seven_days_without_use(self):
+        day = 24 * 60 * 60
+        start = 1_800_000_000
+        with patch("time.time", return_value=start):
+            browser = self.browser(profile_dir=self.profile)
+            kept = await browser.act("tab_new", url="https://example.test/inbox")
+            await browser.control("close", keep_tabs=[kept["tab_id"]])
+        # Evaluating in the tab is a use; listing tabs is not.
+        with patch("time.time", return_value=start + 6 * day):
+            browser = self.browser(profile_dir=self.profile)
+            inbox = next(tab["tab_id"] for tab in (await browser.act("tabs"))["tabs"] if tab["keep"])
+            await browser.act("evaluate", tab_id=inbox, code="document.title")
+            await browser.close()
+        self.assertEqual(self.kept_file(), [{"url": "https://example.test/inbox", "used_at": start + 6 * day}])
+        with patch("time.time", return_value=start + 13 * day):
+            browser = self.browser(profile_dir=self.profile)
+            tabs = (await browser.act("tabs"))["tabs"]
+            self.assertEqual([tab["url"] for tab in tabs if tab["keep"]], ["https://example.test/inbox"])
+            await browser.close()
+        with patch("time.time", return_value=start + 13 * day + 1):
+            browser = self.browser(profile_dir=self.profile)
+            tabs = (await browser.act("tabs"))["tabs"]
+            self.assertEqual([tab["url"] for tab in tabs], ["about:blank"])
+            await browser.close()
+        self.assertEqual(self.kept_file(), [])
+
+    async def test_keeping_again_restarts_the_idle_limit(self):
+        day = 24 * 60 * 60
+        start = 1_800_000_000
+        with patch("time.time", return_value=start):
+            browser = self.browser(profile_dir=self.profile)
+            kept = await browser.act("tab_new", url="https://example.test/inbox")
+            await browser.control("close", keep_tabs=[kept["tab_id"]])
+        with patch("time.time", return_value=start + 5 * day):
+            browser = self.browser(profile_dir=self.profile)
+            inbox = next(tab["tab_id"] for tab in (await browser.act("tabs"))["tabs"] if tab["keep"])
+            await browser.control("close", keep_tabs=[inbox])
+        with patch("time.time", return_value=start + 12 * day):
+            tabs = (await self.browser(profile_dir=self.profile).act("tabs"))["tabs"]
+        self.assertEqual([tab["url"] for tab in tabs if tab["keep"]], ["https://example.test/inbox"])
+
+    async def test_tools_without_tab_ids_never_navigate_a_kept_tab(self):
+        browser = self.browser(profile_dir=self.profile)
+        first = (await browser.act("tabs"))["tabs"][0]["tab_id"]
+        kept = await browser.act("tab_new", url="https://example.test/inbox")
+        await browser.control("keep", keep_tabs=[kept["tab_id"]])
+        await browser.agent("Read the news", url="https://example.test/news")
+        tabs = (await browser.act("tabs"))["tabs"]
+        self.assertEqual([(tab["tab_id"], tab["url"], tab["active"]) for tab in tabs], [
+            (first, "https://example.test/news", True),
+            (kept["tab_id"], "https://example.test/inbox", False),
+        ])
+        # With every tab kept, a new tab takes the navigation.
+        await browser.control("keep", keep_tabs=[first, kept["tab_id"]])
+        await browser.agent("Read the sport", url="https://example.test/sport")
+        tabs = (await browser.act("tabs"))["tabs"]
+        self.assertEqual([(tab["url"], tab["active"], tab["keep"]) for tab in tabs], [
+            ("https://example.test/news", False, True),
+            ("https://example.test/inbox", False, True),
+            ("https://example.test/sport", True, False),
+        ])
+        # A tab ID still controls a kept tab, and its new address is saved.
+        await browser.act("goto", tab_id=kept["tab_id"], url="https://example.test/inbox/2")
+        self.assertEqual([tab["url"] for tab in self.kept_file()],
+                         ["https://example.test/news", "https://example.test/inbox/2"])
+
+    async def test_login_window_shows_no_kept_tabs_and_headless_restart_reopens_them(self):
+        browser = self.browser(profile_dir=self.profile)
+        kept = await browser.act("tab_new", url="https://example.test/inbox")
+        await browser.control("keep", keep_tabs=[kept["tab_id"]])
+        await browser.control("login", url="https://example.test/login")
+        shown = FakeSession.instances[-1]
+        self.assertFalse(shown.options["headless"])
+        self.assertEqual([page.url for page in shown.context.pages], ["https://example.test/login"])
+        await shown.context.close()
+        status = await self.wait_ready(browser)
+        self.assertEqual([(tab["url"], tab["active"], tab["keep"]) for tab in status["tabs"]], [
+            ("https://example.test/login", True, False),
+            ("https://example.test/inbox", False, True),
+        ])
+
+    async def test_agent_tab_close_drops_a_kept_tab_but_other_closes_do_not(self):
+        browser = self.browser(profile_dir=self.profile)
+        first = (await browser.act("tabs"))["tabs"][0]["tab_id"]
+        inbox = await browser.act("tab_new", url="https://example.test/inbox")
+        news = await browser.act("tab_new", url="https://example.test/news")
+        await browser.control("keep", keep_tabs=[first, inbox["tab_id"], news["tab_id"]])
+        # The active tab closes, and every other tab is kept, so a new tab replaces it.
+        await browser.act("tab_close", tab_id=news["tab_id"])
+        self.assertEqual([tab["url"] for tab in self.kept_file()], ["about:blank", "https://example.test/inbox"])
+        tabs = (await browser.act("tabs"))["tabs"]
+        self.assertEqual([(tab["url"], tab["active"], tab["keep"]) for tab in tabs], [
+            ("about:blank", False, True),
+            ("https://example.test/inbox", False, True),
+            ("about:blank", True, False),
+        ])
+        # A tab that the page or the user closes still reopens.
+        session = FakeSession.instances[-1]
+        await session.context.pages[1].close()
+        result = await browser.control("close")
+        self.assertEqual(result["kept_tabs"], ["about:blank", "https://example.test/inbox"])
+
+    async def test_unreadable_kept_tab_list_is_ignored_then_replaced(self):
+        self.profile.mkdir(parents=True)
+        (self.profile / "kept-tabs.json").write_text("{not json")
+        browser = self.browser(profile_dir=self.profile)
+        with contextlib.redirect_stderr(io.StringIO()) as errors:
+            tabs = (await browser.act("tabs"))["tabs"]
+        self.assertEqual(len(tabs), 1)
+        self.assertIn("unreadable kept-tab list", errors.getvalue())
+        kept = await browser.act("tab_new", url="https://example.test/inbox")
+        await browser.control("close", keep_tabs=[kept["tab_id"]])
+        self.assertEqual([tab["url"] for tab in self.kept_file()], ["https://example.test/inbox"])
+
+    async def test_internal_tool_passes_keep_tabs_to_the_browser(self):
+        browser = self.browser(profile_dir=self.profile)
+        kept = await browser.act("tab_new", url="https://example.test/inbox")
+        agent = types.SimpleNamespace(browser=browser, thread_logger=None, headed=False)
+        result = json.loads(await self.code["_tool_browser_session"](
+            agent, "close", keep_tabs=[kept["tab_id"]], result_mode="raw"))
+        self.assertEqual(result["kept_tabs"], ["https://example.test/inbox"])
+
     def test_mcp_exposes_tab_and_dom_operations(self):
         tools = self.code["_browser_mcp_tools"](types.SimpleNamespace(Tool=types.SimpleNamespace))
         tool = next(tool for tool in tools if tool.name == "dtt_browser")
@@ -906,11 +1101,13 @@ class BrowserSessionTests(unittest.IsolatedAsyncioTestCase):
         tools = self.code["_browser_mcp_tools"](types.SimpleNamespace(Tool=types.SimpleNamespace))
         controls = next(tool for tool in tools if tool.name == "dtt_browser_session")
         properties = controls.inputSchema["properties"]
-        self.assertEqual(set(properties["action"]["enum"]), {"status", "open", "resume", "close", "login", "wait"})
+        self.assertEqual(set(properties["action"]["enum"]), {"status", "open", "resume", "keep", "close", "login", "wait"})
         self.assertEqual(properties["session"]["type"], "string")
         self.assertEqual(properties["headed"]["type"], "boolean")
         self.assertIn("timeout_seconds", properties)
+        self.assertEqual(properties["keep_tabs"]["items"]["type"], "string")
         self.assertIn("action", controls.inputSchema["required"])
+
 
 
 class SavedSessionFileTests(unittest.TestCase):

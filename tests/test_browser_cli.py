@@ -172,6 +172,14 @@ class BrowserMcpDispatchTests(unittest.IsolatedAsyncioTestCase):
         await namespace["dispatch"]("dtt_browser", {"action": "upload_files", **params})
         browser.act.assert_awaited_once_with("upload_files", **params)
 
+    async def test_keep_tabs_reach_the_session_control(self):
+        agent = types.SimpleNamespace(_tool_browser_session=AsyncMock(return_value="{}"))
+        namespace = {"agent": agent, "json": json}
+        exec(self.dispatch_code, namespace)
+        await namespace["dispatch"]("dtt_browser_session", {"action": "close", "keep_tabs": ["tab-2"]})
+        agent._tool_browser_session.assert_awaited_once_with(
+            "close", session=None, headed=None, url=None, timeout_seconds=30, keep_tabs=["tab-2"])
+
 
 class BrowserMcpSetupTests(unittest.IsolatedAsyncioTestCase):
     @classmethod

@@ -5,10 +5,12 @@ Notte/Camoufox dependencies. No account, model, remote page or saved profile is 
 """
 
 import asyncio
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 
 from test_browser_sessions import load_browser_code
@@ -154,6 +156,60 @@ class BrowserDomTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(Exception):
             await self.browser.act("wait_for", tab_id=tab_id, selector="#missing", timeout_ms=50)
         self.assertEqual(await self.browser.act("evaluate", tab_id=tab_id, code="'still usable'"), {"value": "still usable"})
+
+    async def test_kept_tab_reopens_live_and_saved_windows_stay_cleared(self):
+        import lz4.block
+
+        class Pages(BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = f"<title>{self.path}</title><p>{self.path}</p>".encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                if self.path == "/login":
+                    self.send_header("Set-Cookie", "sid=signed-in; Path=/")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Pages)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        profile = self.root / "profile"
+
+        def saved_tab_urls():
+            state = json.loads(lz4.block.decompress((profile / "sessionstore.jsonlz4").read_bytes()[8:]))
+            return sorted(tab["entries"][tab["index"] - 1]["url"] if tab.get("entries") else "about:blank"
+                          for window in state["windows"] for tab in window["tabs"])
+
+        try:
+            inbox = await self.browser.act("tab_new", url=base + "/login")
+            await self.browser.act("wait_for", tab_id=inbox["tab_id"], selector="p", timeout_ms=5000)
+            await self.browser.act("tab_new", url=base + "/article")
+            result = await self.browser.control("close", keep_tabs=[inbox["tab_id"]])
+            self.assertEqual(result["kept_tabs"], [base + "/login"])
+            for _ in range(2):
+                browser = type(self.browser)(profile_dir=profile)
+                try:
+                    tabs = (await browser.act("tabs"))["tabs"]
+                    self.assertEqual([(tab["url"], tab["active"], tab["keep"]) for tab in tabs],
+                                     [("about:blank", True, False), (base + "/login", False, True)])
+                    kept = tabs[1]["tab_id"]
+                    await browser.act("wait_for", tab_id=kept, selector="p", timeout_ms=5000)
+                    self.assertEqual(await browser.act("evaluate", tab_id=kept, code="document.title"),
+                                     {"value": "/login"})
+                    # Firefox restores the session cookie from its saved session.
+                    self.assertEqual(await browser.act("evaluate", tab_id=kept, code="document.cookie"),
+                                     {"value": "sid=signed-in"})
+                finally:
+                    await browser.close()
+                # Firefox saves this session's tabs; the next launch clears them first.
+                self.assertEqual(saved_tab_urls(), ["about:blank", base + "/login"])
+        finally:
+            server.shutdown()
+            server.server_close()
 
 
 if __name__ == "__main__":

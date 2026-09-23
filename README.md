@@ -132,6 +132,16 @@ DTT refreshes runtime paths at launch without generating another identity. An in
 
 Only one process can use a named session at a time. A second process reports that the session is in use; close the first browser session before retrying. Orchestrator workers inherit the selected name and display mode, so workers that share a name must take turns with the browser.
 
+### Keeping tabs open between sessions
+
+A tab closes with the browser unless an agent keeps it. DTT keeps tabs with `browser_session(action="close", keep_tabs=["tab-2"], result_mode="raw")`, and an MCP client sends the same list in `dtt_browser_session({"action":"close","keep_tabs":["tab-2"]})`. The `keep` action takes the same list without closing anything. A browser that closes on its own, when a run ends or the MCP server stops, keeps that choice. The list replaces the kept set, so name every tab you want back; `[]` keeps none. `status` and the `dtt_browser` `tabs` action list the tab IDs and mark kept tabs with `keep: true`.
+
+The next session reopens each kept tab as a live tab, in its own window like any new tab, and leaves a blank tab active. Page fetches, and the browser agent when it gets a URL, run in a tab that isn't kept and open one if every tab is kept. A `tab_id` still reaches a kept tab for any action.
+
+Kept tabs expire. Reading or controlling a kept tab restarts its seven-day clock, and so does keeping it again; at session start DTT drops every kept tab whose clock ran out. Closing a kept tab with `tab_close` drops it too, but a tab that the site or you close stays kept. A login that opens a new window shows only the login page there, and kept tabs return when the browser restarts headless.
+
+Firefox's own session restore stays on, because it carries session cookies across restarts. Its restored tabs were never any use: they never load, automation can't see them, and each launch added one more, which is how a profile ends up with thousands. So before each launch DTT clears the windows in Firefox's saved session files and leaves the cookies alone. The profile keeps the kept list in `kept-tabs.json`. Its `user.js` turns session restore on at every startup, so switching it off in a headed window's settings lasts only until the next launch.
+
 ### Browser MCP server
 
 Add dtt to your MCP client's configuration. Use an absolute path to the installed script if the client does not inherit your shell's PATH:
@@ -155,7 +165,7 @@ For a manual login, the client uses this sequence:
 2. `dtt_browser_session({"action":"wait","timeout_seconds":30})` waits for the handoff to finish. Repeat `wait` if the result still says the handoff is active. Each call waits up to 30 seconds; its timeout does not cancel the login. Use `wait` rather than repeated `status` calls.
 3. Once the browser is ready, `dtt_browser({"action":"goto","url":"https://github.com/settings/profile"})` checks access with the saved login. `dtt_fetch` and `dtt_browser_agent` use the same profile. Continue the task after you inspect the page.
 
-Call `dtt_browser_session({"action":"status"})` to inspect the current session, or `dtt_browser_session({"action":"close"})` to close it. The `open` and `resume` actions remain available when a client needs direct control of the pause; the login flow uses `login` and `wait`.
+Call `dtt_browser_session({"action":"status"})` to inspect the current session, or `dtt_browser_session({"action":"close"})` to close it. Pass `keep_tabs` to `close` or `keep` to choose the tabs that reopen in the next session. The `open` and `resume` actions remain available when a client needs direct control of the pause; the login flow uses `login` and `wait`.
 
 Search, fetch, browser steps, and session control need no OpenRouter key in MCP mode. Only `dtt_browser_agent` requires `OPENROUTER_API_KEY`.
 
@@ -163,7 +173,7 @@ Search, fetch, browser steps, and session control need no OpenRouter key in MCP 
 
 | Action | Parameters | Result |
 |---|---|---|
-| `tabs` | None | `tabs` array with each tab's `tab_id`, `url`, and `active` state |
+| `tabs` | None | `tabs` array with each tab's `tab_id`, `url`, `active` state, and `keep` flag |
 | `tab_new` | Optional `url` | Opens and selects a tab; returns its `tab_id` and `url` |
 | `tab_select` | `tab_id` | Selects the default tab; returns its `tab_id` and `url` |
 | `tab_close` | `tab_id` | Closes the tab; returns its `tab_id` and `closed: true` |
@@ -172,7 +182,7 @@ Search, fetch, browser steps, and session control need no OpenRouter key in MCP 
 | `click_selector` | `selector`, optional `tab_id` and `timeout_ms` | Clicks one matching element with native input; returns `tab_id`, `url`, and `clicked: true` |
 | `upload_files` | `selector`, `paths`, optional `tab_id` and `timeout_ms` | Sets a file input's files; returns `tab_id`, `url`, and the `uploaded` paths |
 
-All tabs use the same saved browser context, including its login state. Tab IDs stay stable through navigation and other tabs' closure; a browser restart invalidates them. An explicit `tab_id` on page operations, including the existing `goto`, `observe`, and `click` actions, targets that tab without changing the default. If you close the final tab, DTT creates a blank replacement to keep the context open.
+All tabs use the same saved browser context, including its login state. Tab IDs stay stable through navigation and other tabs' closure; a browser restart invalidates them, and kept tabs reopen with new IDs. An explicit `tab_id` on page operations, including the existing `goto`, `observe`, and `click` actions, targets that tab without changing the default. If you close the final tab, DTT creates a blank replacement to keep the context open.
 
 `tab_new` with a URL returns when navigation commits. Scripts and other resources can still be pending. Take the returned `tab_id` and call `wait_for` with the selector your next action needs, then inspect the page. `wait_for`, `click_selector`, and `upload_files` default to 30,000 ms and accept a timeout up to 120,000 ms.
 
@@ -355,6 +365,7 @@ All variables can be saved to `~/.dtt/env` (shell-exported values take precedenc
 | `~/.dtt/threads/<id>/cache/` | Per-thread scratch folder (intermediate files, downloads, batch artifacts) |
 | `~/.dtt/browser-sessions/<name>/profile/` | Firefox profile with saved cookies, localStorage, and IndexedDB for a named session |
 | `~/.dtt/browser-sessions/<name>/profile/camoufox-config.json` | Private generated fingerprint and Firefox preferences reused across browser launches |
+| `~/.dtt/browser-sessions/<name>/profile/kept-tabs.json` | Tabs that reopen in the next session, with the time an agent last used or kept each one |
 | `~/.dtt/skills/<name>/SKILL.md` | User-defined skills (Claude Code convention) |
 | `~/.dtt/mcp.json` | MCP server configuration |
 | `/tmp/dothething/` | Runtime: Python venv, SearXNG, Camoufox browser |

@@ -913,5 +913,71 @@ class BrowserSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("action", controls.inputSchema["required"])
 
 
+class SavedSessionFileTests(unittest.TestCase):
+    """Firefox session files, written with the lz4 package that Firefox's format uses."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.code = load_browser_code()
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="dtt-session-files-")
+        self.profile = Path(self.temp.name) / "profile"
+        (self.profile / "sessionstore-backups").mkdir(parents=True)
+        self.browser = self.code["Browser"](profile_dir=self.profile)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    @staticmethod
+    def write(path, state):
+        import lz4.block
+        path.write_bytes(b"mozLz40\0" + lz4.block.compress(json.dumps(state).encode("utf-8")))
+
+    @staticmethod
+    def read(path):
+        import lz4.block
+        return json.loads(lz4.block.decompress(path.read_bytes()[8:]))
+
+    def test_saved_windows_go_and_session_cookies_stay_in_every_copy(self):
+        cookies = [{"host": "example.test", "name": "sid", "value": "māori 🦕", "path": "/"}]
+        window = {"tabs": [{"entries": [{"url": "https://example.test/old"}], "index": 1}], "selected": 1}
+        state = {"version": ["sessionrestore", 1], "windows": [window] * 3, "_closedWindows": [window],
+                 "selectedWindow": 2, "cookies": cookies, "session": {"lastUpdate": 1}, "global": {}}
+        backups = self.profile / "sessionstore-backups"
+        files = [self.profile / "sessionstore.jsonlz4", backups / "recovery.jsonlz4",
+                 backups / "recovery.baklz4", backups / "previous.jsonlz4",
+                 backups / "upgrade.jsonlz4-20260719045605"]
+        for path in files:
+            self.write(path, state)
+        corrupt = backups / "recovery.jsonlz4.tmp"
+        corrupt.write_bytes(b"mozLz40\0" + b"\x64\x00\x00\x00" + b"\xff" * 16)
+        other = backups / "notes.txt"
+        other.write_text("not a session")
+        self.browser._forget_saved_windows()
+        for path in files:
+            with self.subTest(path=path.name):
+                saved = self.read(path)
+                self.assertEqual((saved["windows"], saved["_closedWindows"], saved["selectedWindow"]), ([], [], 0))
+                self.assertEqual(saved["cookies"], cookies)
+                self.assertEqual(saved["session"], {"lastUpdate": 1})
+                self.assertEqual(saved["version"], ["sessionrestore", 1])
+        self.assertEqual(corrupt.read_bytes(), b"mozLz40\0" + b"\x64\x00\x00\x00" + b"\xff" * 16)
+        self.assertEqual(other.read_text(), "not a session")
+        self.assertEqual([path.name for path in self.profile.rglob(".*")], [])
+
+    def test_profile_without_saved_session_is_unchanged(self):
+        self.browser._forget_saved_windows()
+        self.assertEqual(list(self.profile.rglob("*")), [self.profile / "sessionstore-backups"])
+
+    def test_startup_prefs_keep_session_restore_on(self):
+        self.browser._write_user_prefs()
+        path = self.profile / "user.js"
+        lines = path.read_text().splitlines()
+        self.assertIn('user_pref("browser.startup.page", 3);', lines)
+        self.assertIn('user_pref("browser.sessionstore.resume_from_crash", true);', lines)
+        self.assertIn('user_pref("browser.sessionstore.privacy_level", 0);', lines)
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
 if __name__ == "__main__":
     unittest.main()

@@ -457,17 +457,17 @@ ensure_venv() {
 }
 
 # ── Main Python environment ──────────────────────────────────────
-ensure_venv "$VENV" "$DTT_CACHE/.deps_v7" "$DTT_CACHE/.notte_pin"
+ensure_venv "$VENV" "$DTT_CACHE/.deps_v8" "$DTT_CACHE/.notte_pin"
 source "$VENV/bin/activate"
 
-if [ ! -f "$DTT_CACHE/.deps_v7" ]; then
+if [ ! -f "$DTT_CACHE/.deps_v8" ]; then
     echo "▸ Installing dependencies (first run)..."
     pip install -q -U pip setuptools wheel 2>/dev/null
     pip install -q requests httpx "prompt_toolkit>=3" \
         lxml beautifulsoup4 pyyaml Pillow tiktoken \
         markitdown pypdf python-docx openpyxl tabulate mcp \
-        rich textual agentmail 2>/dev/null
-    touch "$DTT_CACHE/.deps_v7"
+        rich textual agentmail lz4 2>/dev/null
+    touch "$DTT_CACHE/.deps_v8"
 fi
 
 # ── SearXNG in its own venv ──────────────────────────────────────
@@ -1992,6 +1992,17 @@ class Browser:
         "initializing", "spinner", "skeleton",
     ]
 
+    # Firefox restores session cookies only when it restores the session, so
+    # keep restore on. user.js applies these at startup, so a value changed in
+    # a headed window's settings cannot skip a restore.
+    RUNTIME_PREFS = {
+        "media.volume_scale": "0.0",
+        "browser.startup.page": 3,
+        "browser.sessionstore.resume_from_crash": True,
+        # Camoufox defaults to 2, which drops session cookies on quit.
+        "browser.sessionstore.privacy_level": 0,
+    }
+
     def __init__(self, headless=True, session_name=None, profile_dir=None):
         self._session = None
         self._lock = asyncio.Lock()
@@ -2065,6 +2076,62 @@ class Browser:
             os.close(self._profile_lock)
             self._profile_lock = None
 
+    @staticmethod
+    def _replace_file(path, data):
+        """Atomically replace a file with bytes that only this user can read."""
+        descriptor, temporary = tempfile.mkstemp(prefix=f".{path.stem}-", dir=path.parent)
+        try:
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+    def _forget_saved_windows(self):
+        """Drop Firefox's saved windows and keep its saved session cookies.
+
+        Firefox restores saved windows as tabs that never load and that
+        Playwright never reports, and each launch adds its start page to them.
+        Firefox reads the first valid file of several after a crash, so clear
+        every copy.
+        """
+        import lz4.block
+        magic = b"mozLz40\0"
+        backups = self._profile_dir / "sessionstore-backups"
+        paths = [self._profile_dir / "sessionstore.jsonlz4"]
+        if backups.is_dir():
+            paths += sorted(backups.iterdir())
+        for path in paths:
+            try:
+                if path.is_symlink() or not path.is_file():
+                    continue
+                data = path.read_bytes()
+                if not data.startswith(magic):
+                    continue
+                state = json.loads(lz4.block.decompress(data[len(magic):]))
+            except (OSError, ValueError, lz4.block.LZ4BlockError):
+                continue  # Firefox cannot restore windows from it either.
+            if not isinstance(state, dict) or not (state.get("windows") or state.get("_closedWindows")):
+                continue
+            state.update(windows=[], _closedWindows=[], selectedWindow=0)
+            text = json.dumps(state, separators=(",", ":"))
+            self._replace_file(path, magic + lz4.block.compress(text.encode("utf-8")))
+
+    def _write_user_prefs(self):
+        """Apply DTT's prefs from startup, when Firefox decides whether to restore."""
+        lines = [f"user_pref({json.dumps(name)}, {json.dumps(value)});"
+                 for name, value in self.RUNTIME_PREFS.items()]
+        self._replace_file(self._profile_dir / "user.js", ("\n".join(lines) + "\n").encode("utf-8"))
+
+    def _prepare_launch(self):
+        options = self._camoufox_launch_options()
+        self._forget_saved_windows()
+        self._write_user_prefs()
+        return options
+
     def _camoufox_launch_options(self):
         """Keep fingerprint identity in the profile; rebuild runtime options."""
         from camoufox.addons import add_default_addons, confirm_paths
@@ -2076,13 +2143,6 @@ class Browser:
             raise RuntimeError("CAMOU_CONFIG environment overrides conflict with the saved browser fingerprint.")
 
         path = self._profile_dir / "camoufox-config.json"
-        runtime_prefs = {
-            "media.volume_scale": "0.0",
-            "browser.startup.page": 3,
-            "browser.sessionstore.resume_from_crash": True,
-            # Camoufox defaults to 2, which drops session cookies on quit.
-            "browser.sessionstore.privacy_level": 0,
-        }
 
         def digest(config, prefs):
             data = json.dumps({"config": config, "firefox_user_prefs": prefs},
@@ -2129,7 +2189,7 @@ class Browser:
             config = {}
             generated = launch_options(
                 config=config, headless=self._headless,
-                firefox_user_prefs=dict(runtime_prefs),
+                firefox_user_prefs=dict(self.RUNTIME_PREFS),
                 user_data_dir=str(self._profile_dir),
             )
             # Add-on locations and executable/environment paths belong to this
@@ -2137,20 +2197,11 @@ class Browser:
             config.pop("addons", None)
             validate_identity(config)
             generated_prefs = {key: value for key, value in generated["firefox_user_prefs"].items()
-                               if key not in runtime_prefs}
+                               if key not in self.RUNTIME_PREFS}
             saved = {"version": 1, "config": config, "firefox_user_prefs": generated_prefs,
                      "sha256": digest(config, generated_prefs)}
-            descriptor, temporary = tempfile.mkstemp(prefix=".camoufox-config-", dir=self._profile_dir)
-            try:
-                with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-                    json.dump(saved, stream, ensure_ascii=False, sort_keys=True, allow_nan=False)
-                    stream.write("\n")
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                os.replace(temporary, path)
-            finally:
-                if os.path.exists(temporary):
-                    os.unlink(temporary)
+            text = json.dumps(saved, ensure_ascii=False, sort_keys=True, allow_nan=False)
+            self._replace_file(path, (text + "\n").encode("utf-8"))
 
         config = copy.deepcopy(config)
         addons = []
@@ -2164,7 +2215,7 @@ class Browser:
             "executable_path": launch_path(),
             "args": [],
             "env": {**os.environ, **get_env_vars(config, get_target_os(config))},
-            "firefox_user_prefs": {**generated_prefs, **runtime_prefs},
+            "firefox_user_prefs": {**generated_prefs, **self.RUNTIME_PREFS},
             "headless": self._headless,
             "user_data_dir": str(self._profile_dir),
         }
@@ -2183,7 +2234,7 @@ class Browser:
             viewport_height=DEFAULT_HEADLESS_VIEWPORT_HEIGHT,
         )
         options = BrowserWindowOptions.from_request(SessionStartRequest(**settings))
-        build = asyncio.get_running_loop().run_in_executor(None, self._camoufox_launch_options)
+        build = asyncio.get_running_loop().run_in_executor(None, self._prepare_launch)
         try:
             launch_options = await asyncio.shield(build)
         except asyncio.CancelledError:
